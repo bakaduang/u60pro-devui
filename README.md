@@ -1,4 +1,4 @@
-# U60 Pro 屏幕管理（u60pro-devui-clean）
+# U60 Pro 屏幕管理（u60pro-devui）
 
 ZTE U60 Pro 小屏的社区界面插件，适配 **UFI-TOOLS-ZWRT 1.0**。包含：
 

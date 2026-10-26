@@ -63,7 +63,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: u60pro-devui-clean
+          name: u60pro-devui
           path: dist/*
 
       - name: Publish release
