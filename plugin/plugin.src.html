@@ -1,0 +1,850 @@
+</script>
+<script>
+// U60 屏幕管理 __PLUGIN_VERSION__ — UFI-TOOLS-ZWRT 1.0 插件
+// 文件第一行单独的脚本结束标签是防护：面板把所有插件拼成一段 HTML 解析，若排在前面的
+// 插件漏写了脚本结束标签（例如 u60投屏.txt），它会把后面的插件吞进自己的脚本，两者都失效。
+// 管理 U60 Pro 小屏的社区渲染器（u60pro-devui）与页面 UI；页面 UI 内置于本插件，
+// 也可以从 GitHub Release 在线更新（__REPO__，由 GitHub Actions 从源码构建）。
+// 渲染器与页面基于 33333s/u60pro-devui、scoltzero/u60pro-devui-remix（MIT），
+// 扩展页接口（xpage）与“Clean”界面为本版新增，可在设备上控制小海关与 Clash 插件。
+// 1.0 平台已内置 datad：本插件不安装、不启动、不停止任何 datad。
+(() => {
+  'use strict'
+  const ID = 'u60s1'
+  if (window[`__${ID}_loaded`]) return
+  window[`__${ID}_loaded`] = true
+
+  const PLUGIN_VERSION = '__PLUGIN_VERSION__'
+  const REPO = '__REPO__'
+  const GH = `https://github.com/${REPO}`
+  const GH_MIRRORS = ['https://gh-proxy.com/', 'https://ghfast.top/']
+  const LS_GH = `${ID}_ghproxy`
+  const UI_VERSION = '__UI_VERSION__'
+  const UI_FILES = __UI_FILES__
+  const DIR = '/data/plugins/u60pro-devui'
+  const UI = `${DIR}/ui`
+  const BIN = `${DIR}/u60pro-devui`
+  const START_SH = `${DIR}/start-devui.sh`
+  const STAGE = `${DIR}/.stage`
+  const BOOT = '/data/plugins/ufi_tools_boot.sh'
+  const BOOT_LINE = `sh ${START_SH} boot >/tmp/u60pro-devui-boot.log 2>&1 &`
+  const LEGACY_DATAD = '/data/plugins/zwrt-datad/zwrt-datad'
+  const XP_MARKER = 'DEVUI-XPAGE-API-2'
+  const XP_MARKER_V1 = 'DEVUI-XPAGE-API-1'
+  const XP_LABEL = { 2: '扩展版（支持小海关 / Clash 页）', 1: '旧扩展版（需更新才能用新扩展页）', 0: '原版（不支持扩展页）' }
+  const PRESETS = {
+    remix: {
+      label: 'scoltzero remix v1.2.12-remix.13 原版（无扩展页）',
+      url: 'https://github.com/scoltzero/u60pro-devui-remix/releases/download/v1.2.12-remix.13/u60pro-devui-aarch64',
+      sha: '74fb4cb792fee4e52b67272adeaa2b15a52728d71fd8e0205e41beb40a398e9c',
+    },
+  }
+  const LS_SRC = `${ID}_src`
+  const LS_URL = `${ID}_url`
+  const LS_SHA = `${ID}_sha`
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  // 面板的 .mask 只有 position:fixed 且带 transform，未设 top/left；插到 body 末尾时必须自己钉在视口上
+  const MASK_POS = 'top:0;left:0;right:0;bottom:0;margin:0'
+  const lsGet = (k) => { try { return localStorage.getItem(k) || '' } catch (e) { return '' } }
+  const lsSet = (k, v) => { try { localStorage.setItem(k, v) } catch (e) {} }
+  const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'"
+  const toast = (text, color, delay) => {
+    try { if (typeof createToast === 'function') return createToast(text, color, delay) } catch (e) {}
+    console.log(`[${ID}]`, text)
+  }
+  const baseURL = () => (typeof KANO_baseURL !== 'undefined' && KANO_baseURL ? KANO_baseURL : '/api')
+  const pageHeaders = () => {
+    const h = {}
+    if (typeof common_headers !== 'undefined' && common_headers) Object.assign(h, common_headers)
+    return h
+  }
+
+  // 独立插件固定直接调用受登录态保护的 /api/run_shell
+  const shell = async (cmd, timeout = 15000) => {
+    const headers = pageHeaders()
+    headers['Content-Type'] = 'application/json'
+    const response = await fetch(`${baseURL()}/run_shell`, {
+      method: 'POST', headers, credentials: 'same-origin',
+      body: JSON.stringify({ cmd: String(cmd), timeout: Number(timeout) || 15000 }),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (response.status === 401) throw new Error('登录已失效，请刷新页面后重新登录')
+    if (!response.ok) throw new Error(result.content || result.error || `HTTP ${response.status}`)
+    if (!result || !result.success) throw new Error(result && result.content || '命令执行失败')
+    return String(result.content || '')
+  }
+  const kv = (text) => {
+    const o = {}
+    String(text || '').split('\n').forEach((line) => {
+      const i = line.indexOf('=')
+      if (i > 0) o[line.slice(0, i).trim()] = line.slice(i + 1).trim()
+    })
+    return o
+  }
+  const readBuffer = (blob) => (typeof blob.arrayBuffer === 'function'
+    ? blob.arrayBuffer()
+    : new Promise((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(r.result)
+      r.onerror = () => reject(r.error || new Error('读取文件失败'))
+      r.readAsArrayBuffer(blob)
+    }))
+  const upload = async (blob, name, targetDir) => {
+    const form = new FormData()
+    form.append('file', new File([blob], name, { type: 'application/octet-stream' }))
+    form.append('path', targetDir)
+    const headers = pageHeaders()
+    delete headers['Content-Type']
+    delete headers['content-type']
+    const response = await fetch(`${baseURL()}/upload_file`, { method: 'POST', headers, credentials: 'same-origin', body: form })
+    const body = await response.json().catch(() => ({}))
+    if (!response.ok || body.result !== 'success') throw new Error(body.error || `上传失败（HTTP ${response.status}）`)
+    return body
+  }
+
+  // ---- 内置页面包 -> ustar（BusyBox tar 可直接解包） ----
+  const buildTar = (files) => {
+    const enc = new TextEncoder()
+    const chunks = []
+    const header = (name, size, mode, type) => {
+      const h = new Uint8Array(512)
+      const put = (s, off, len) => h.set(enc.encode(s).subarray(0, len), off)
+      const oct = (n, len) => n.toString(8).padStart(len - 1, '0') + '\0'
+      put(name, 0, 100); put(oct(mode, 8), 100, 8); put(oct(0, 8), 108, 8); put(oct(0, 8), 116, 8)
+      put(oct(size, 12), 124, 12); put(oct(Math.floor(Date.now() / 1000), 12), 136, 12)
+      h.fill(32, 148, 156); put(type, 156, 1); put('ustar\0', 257, 6); put('00', 263, 2)
+      let sum = 0
+      for (const b of h) sum += b
+      put(sum.toString(8).padStart(6, '0') + '\0 ', 148, 8)
+      return h
+    }
+    const dirs = new Set()
+    Object.keys(files).forEach((p) => { const i = p.lastIndexOf('/'); if (i > 0) dirs.add(p.slice(0, i + 1)) })
+    dirs.forEach((d) => chunks.push(header(d, 0, 0o755, '5')))
+    Object.keys(files).forEach((p) => {
+      const data = enc.encode(files[p])
+      if (enc.encode(p).length >= 100) throw new Error(`文件名过长：${p}`)
+      chunks.push(header(p, data.length, p.endsWith('.sh') ? 0o755 : 0o644, '0'), data)
+      const pad = (512 - (data.length % 512)) % 512
+      if (pad) chunks.push(new Uint8Array(pad))
+    })
+    chunks.push(new Uint8Array(1024))
+    return new Blob(chunks, { type: 'application/x-tar' })
+  }
+
+  // ---- 设备端脚本（只包含固定路径与已校验参数） ----
+  const START_SCRIPT = [
+    '#!/bin/sh',
+    '# U60 屏幕管理 1.0：停原厂渲染器，启动社区渲染器。由插件生成，可重复执行。',
+    `D=${DIR}`,
+    'BIN=$D/u60pro-devui',
+    'MODE=${1:-manual}',
+    '[ -x "$BIN" ] || exit 1',
+    'if [ "$MODE" = boot ]; then',
+    '  st=$(awk -F"\'" \'/option mode_main_state/ {print $2; exit}\' /etc/config/zwrt_zte_mc_tmp 2>/dev/null)',
+    '  case "$st" in mode_power_off_*) exit 0 ;; esac',
+    '  pidof u60pro-devui >/dev/null 2>&1 && exit 0',
+    '  i=0',
+    '  while [ $i -lt 30 ]; do curl -s -m 2 -o /dev/null http://127.0.0.1:9460/state && break; sleep 2; i=$((i + 1)); done',
+    'fi',
+    'killall u60pro-devui 2>/dev/null',
+    '/etc/init.d/zte_topsw_devui stop >/dev/null 2>&1',
+    'i=0',
+    'while pidof zte_topsw_devui >/dev/null 2>&1 && [ $i -lt 10 ]; do killall -9 zte_topsw_devui 2>/dev/null; sleep 1; i=$((i + 1)); done',
+    'pidof u60pro-devui >/dev/null 2>&1 && { killall -9 u60pro-devui 2>/dev/null; sleep 1; }',
+    'cd "$D" || exit 1',
+    ': > /tmp/u60pro-devui.log',
+    'nohup "$BIN" >>/tmp/u60pro-devui.log 2>&1 </dev/null &',
+    'exit 0',
+  ].join('\n')
+
+  const STATUS_SCRIPT = [
+    `D=${DIR}`,
+    'echo "ARCH=$(uname -m)"',
+    'echo "BIN=$([ -x $D/u60pro-devui ] && echo 1 || echo 0)"',
+    `X=0; grep -q ${XP_MARKER_V1} $D/u60pro-devui 2>/dev/null && X=1; grep -q ${XP_MARKER} $D/u60pro-devui 2>/dev/null && X=2; echo "BIN_XP=$X"`,
+    'echo "BIN_SHA=$(sha256sum $D/u60pro-devui 2>/dev/null | cut -c1-12)"',
+    'echo "BIN_KB=$(($(wc -c < $D/u60pro-devui 2>/dev/null || echo 0) / 1024))"',
+    'echo "RUN=$(pidof u60pro-devui >/dev/null 2>&1 && echo 1 || echo 0)"',
+    'echo "OEM=$(pidof zte_topsw_devui >/dev/null 2>&1 && echo 1 || echo 0)"',
+    'echo "UI_VER=$(head -n 1 $D/ui/.ui-version 2>/dev/null)"',
+    'echo "UI_PAGES=$(ls $D/ui/*.html 2>/dev/null | wc -l)"',
+    'echo "UI_MANIFEST=$([ -f $D/ui/.devui-managed-files ] && grep -c "" $D/ui/.devui-managed-files || echo 0)"',
+    'echo "START=$([ -f $D/start-devui.sh ] && echo 1 || echo 0)"',
+    `echo "BOOT=$(grep -qF ${q(BOOT_LINE)} ${BOOT} 2>/dev/null && echo 1 || echo 0)"`,
+    'echo "RC_DEVUI=$(grep -cE "u60pro_devui_devui|u60pro-devui/start-devui[.]sh|#[[:space:]]*u60pro_devui[[:space:]]*$" /etc/rc.local 2>/dev/null)"',
+    'echo "RC_DATAD=$(grep -c "u60pro_devui_datad" /etc/rc.local 2>/dev/null)"',
+    'echo "DATAD_HTTP=$(curl -s -m 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:9460/state 2>/dev/null)"',
+    // datad 以进程命令行识别（1.0 内置版的进程名/路径不固定），并记录启动命令供排查
+    'X=""; C=""; for d in /proc/[0-9]*; do c=$(tr "\\000" " " < $d/cmdline 2>/dev/null); case "$c" in *datad*) case "$c" in *curl*|*grep*|*" -c "*) continue ;; esac; X="$X $(readlink $d/exe 2>/dev/null)"; C="$c" ;; esac; done; echo "DATAD_EXE=$X"; echo "DATAD_CMD=$C"',
+    'echo "DATAD_LISTEN=$(netstat -lntp 2>/dev/null | awk \'$4 ~ /:9460$/ {print $7; exit}\')"',
+    `echo "LEGACY_DATAD=$([ -e ${LEGACY_DATAD} ] && echo 1 || echo 0)"`,
+    'echo "XP_RUNTIME=$([ -f /tmp/devui-x/api ] && echo 1 || echo 0)"',
+    'echo "CUSTOMS=$([ -x /data/plugins/customs/mihomo ] && echo 1 || echo 0)"',
+    'echo "CLASH=$([ -f /data/plugins/clash/clashctl.sh ] && echo 1 || echo 0)"',
+    'echo "GZIP=$(command -v gzip >/dev/null 2>&1 && echo 1 || echo 0)"',
+    'echo "FREE_KB=$(df -k /data 2>/dev/null | tail -n 1 | awk \'{print $(NF-2)}\')"',
+    'echo "CURL=$(command -v curl >/dev/null 2>&1 && echo 1 || echo 0)"',
+    'echo "TAR=$(command -v tar >/dev/null 2>&1 && echo 1 || echo 0)"',
+  ].join('\n')
+
+  const writeStartScript = async () => {
+    const b64 = btoa(String.fromCharCode(...new TextEncoder().encode(START_SCRIPT + '\n')))
+    await shell(`mkdir -p ${DIR} && printf '%s' '${b64}' | base64 -d > ${START_SH}.tmp && chmod 755 ${START_SH}.tmp && mv -f ${START_SH}.tmp ${START_SH} && echo ok`, 8000)
+  }
+
+  const RC_DEVUI_CLEAN = "[ -f /etc/rc.local ] && sed -i -e '/u60pro_devui_devui/d' -e '\\#u60pro-devui/start-devui\\.sh#d' -e '/#[[:space:]]*u60pro_devui[[:space:]]*$/d' /etc/rc.local; true"
+
+  const startRenderer = async () => {
+    await shell(`sh ${START_SH} manual; sleep 3; pidof u60pro-devui >/dev/null 2>&1 && echo RUNNING || echo FAILED`, 30000)
+      .then((out) => { if (!/RUNNING/.test(out)) throw new Error('屏幕程序未能启动') })
+  }
+  const restoreOem = async () => {
+    await shell('killall u60pro-devui 2>/dev/null; sleep 1; killall -9 u60pro-devui 2>/dev/null; /etc/init.d/zte_topsw_devui enable >/dev/null 2>&1; /etc/init.d/zte_topsw_devui start >/dev/null 2>&1; sleep 2; pidof zte_topsw_devui >/dev/null 2>&1 && echo OEM_OK || echo OEM_WAIT', 20000)
+  }
+  const setBoot = async (on) => {
+    if (on) {
+      await shell([
+        'mkdir -p /data/plugins',
+        `[ -f ${BOOT} ] || printf '#!/bin/sh\\n' > ${BOOT}`,
+        `sed -i '\\#u60pro-devui/start-devui\\.sh#d' ${BOOT}`,
+        `printf '%s\\n' ${q(BOOT_LINE)} >> ${BOOT}`,
+        `chmod 700 ${BOOT}`,
+        RC_DEVUI_CLEAN,
+        'echo ok',
+      ].join('\n'), 8000)
+    } else {
+      await shell(`[ -f ${BOOT} ] && sed -i '\\#u60pro-devui/start-devui\\.sh#d' ${BOOT}; ${RC_DEVUI_CLEAN}; echo ok`, 8000)
+    }
+  }
+
+  const installUi = async (log) => {
+    log('打包内置页面 UI …')
+    const files = Object.assign({}, UI_FILES)
+    const blob = buildTar(files)
+    log(`上传页面包（${Math.round(blob.size / 1024)} KB）…`)
+    await shell(`rm -rf ${STAGE} && mkdir -p ${STAGE} && echo ok`, 8000)
+    await upload(blob, 'ui.tar', STAGE)
+    await applyUiTar(log)
+  }
+
+  // 校验 $STAGE/ui.tar 的清单后整体替换页面（保留锁屏密码、屏幕设置与用户自己的页面）
+  const applyUiTar = async (log) => {
+    log('校验并替换页面 …')
+    const out = await shell([
+      `D=${DIR}; UI=$D/ui; ST=${STAGE}`,
+      '[ -s $ST/ui.tar ] || { echo "ERR 页面包上传失败"; exit 0; }',
+      'mkdir -p $ST/new && tar -xf $ST/ui.tar -C $ST/new 2>&1 || { echo "ERR 页面包解包失败"; exit 0; }',
+      'M=$ST/new/.devui-managed-files',
+      '[ -s $M ] || { echo "ERR 页面包缺少清单"; exit 0; }',
+      'while IFS= read -r rel || [ -n "$rel" ]; do',
+      '  case "$rel" in ""|/*|*..*) echo "ERR 非法路径 $rel"; exit 0 ;; esac',
+      '  [ -f "$ST/new/$rel" ] || { echo "ERR 页面包缺少 $rel"; exit 0; }',
+      'done < $M',
+      'mkdir -p $UI/functions $UI/subpages',
+      'rm -rf $D/.ui-backup; cp -a $UI $D/.ui-backup 2>/dev/null',
+      'if [ -f $UI/.devui-managed-files ]; then',
+      '  while IFS= read -r rel || [ -n "$rel" ]; do case "$rel" in ""|/*|*..*) continue ;; esac; rm -f "$UI/$rel"; done < $UI/.devui-managed-files',
+      'fi',
+      'cp -a $ST/new/. $UI/ || { rm -rf $UI; mv $D/.ui-backup $UI; echo "ERR 页面复制失败，已还原"; exit 0; }',
+      'chmod 755 $UI/functions/*.sh 2>/dev/null',
+      'rm -rf $ST',
+      'echo "OK $(grep -c "" $UI/.devui-managed-files)"',
+    ].join('\n'), 30000)
+    if (!/^OK/m.test(out)) throw new Error((out.match(/ERR .*/) || [out.trim() || '页面安装失败'])[0].replace(/^ERR /, ''))
+    log(`页面 UI 已更新（${out.match(/OK (\d+)/)[1]} 个文件）`)
+  }
+
+  const installBinaryFromStage = async (stageFile, sha, log) => {
+    const out = await shell([
+      `D=${DIR}; NEW=${q(stageFile)}`,
+      '[ -s "$NEW" ] || { echo "ERR 未找到渲染程序文件"; exit 0; }',
+      '[ "$(head -c 4 "$NEW" | tail -c 3)" = ELF ] || { rm -f "$NEW"; echo "ERR 不是 ELF 可执行文件"; exit 0; }',
+      'S=$(sha256sum "$NEW" | cut -d" " -f1)',
+      sha ? `[ "$S" = ${q(sha)} ] || { rm -f "$NEW"; echo "ERR SHA-256 不匹配：$S"; exit 0; }` : ':',
+      'chmod 755 "$NEW"',
+      '[ -f $D/u60pro-devui ] && cp -f $D/u60pro-devui $D/.u60pro-devui.bak',
+      'mv -f "$NEW" $D/u60pro-devui || { echo "ERR 替换渲染程序失败"; exit 0; }',
+      `X=0; grep -q ${XP_MARKER_V1} $D/u60pro-devui && X=1; grep -q ${XP_MARKER} $D/u60pro-devui && X=2`,
+      'echo "OK $S $X"',
+    ].join('\n'), 20000)
+    const m = out.match(/OK ([0-9a-f]{64}) ([012])/)
+    if (!m) throw new Error((out.match(/ERR .*/) || [out.trim() || '安装渲染程序失败'])[0].replace(/^ERR /, ''))
+    log(`渲染程序已安装：${XP_LABEL[m[2]]} · SHA-256 ${m[1].slice(0, 16)}…`)
+    return { sha: m[1], xp: Number(m[2]) }
+  }
+
+  const downloadBinary = async (url, sha, log) => {
+    log('设备下载渲染程序（最长 5 分钟）…')
+    const tmp = `${STAGE}/u60pro-devui.dl`
+    const out = await shell([
+      `mkdir -p ${STAGE}; rm -f ${tmp}`,
+      `U=${q(url)}`,
+      `curl -fL --connect-timeout 15 --max-time 240 -o ${tmp} "$U" 2>&1 | tail -n 2`,
+      `if [ ! -s ${tmp} ] && (netstat -lnt 2>/dev/null | grep -q ':7890 '); then`,
+      `  echo "直连失败，改用本机代理 127.0.0.1:7890"; curl -fL -x http://127.0.0.1:7890 --connect-timeout 15 --max-time 240 -o ${tmp} "$U" 2>&1 | tail -n 2`,
+      'fi',
+      `[ -s ${tmp} ] && echo "DL_OK $(wc -c < ${tmp})" || echo "DL_FAIL"`,
+    ].join('\n'), 520000)
+    const m = out.match(/DL_OK (\d+)/)
+    if (!m) throw new Error(`下载失败：${out.replace(/DL_FAIL/, '').trim().split('\n').pop() || '网络不可达'}`)
+    log(`下载完成 ${(Number(m[1]) / 1048576).toFixed(2)} MB`)
+    return installBinaryFromStage(tmp, sha, log)
+  }
+
+  // ---- 在线更新（GitHub Release，依次尝试加速地址、直连、镜像与 jsDelivr） ----
+  const ghProxy = () => {
+    const v = lsGet(LS_GH)
+    return v === '-' ? '' : (v || GH_MIRRORS[0])
+  }
+  const mirrorURLs = (githubURL, distFile) => {
+    const p = ghProxy()
+    const list = [p ? p + githubURL : '', githubURL, ...GH_MIRRORS.map((m) => m + githubURL)]
+    if (distFile) list.push(`https://cdn.jsdelivr.net/gh/${REPO}@dist/${distFile}`, `https://fastly.jsdelivr.net/gh/${REPO}@dist/${distFile}`)
+    return [...new Set(list.filter(Boolean))]
+  }
+  // 设备上按顺序下载，成功即停；全部失败且本机 7890 有代理时再经代理试一次直连地址
+  const deviceFetch = async (urls, out, maxTime, log) => {
+    const res = await shell([
+      `O=${q(out)}; mkdir -p "$(dirname "$O")"; rm -f "$O" "$O.part"`,
+      `for U in ${urls.map(q).join(' ')}; do`,
+      `  curl -fsSL --connect-timeout 10 --max-time ${maxTime} -o "$O.part" "$U" 2>/dev/null && [ -s "$O.part" ] && mv -f "$O.part" "$O" && { echo "DL_OK $(wc -c < "$O") $U"; exit 0; }`,
+      '  echo "DL_TRY ${U%%/https*}"',
+      'done',
+      `if netstat -lnt 2>/dev/null | grep -q ':7890 '; then`,
+      `  U=${q(urls.find((u) => u.startsWith('https://github.com/')) || urls[0])}`,
+      `  curl -fsSL -x http://127.0.0.1:7890 --connect-timeout 10 --max-time ${maxTime} -o "$O.part" "$U" 2>/dev/null && [ -s "$O.part" ] && mv -f "$O.part" "$O" && { echo "DL_OK $(wc -c < "$O") 本机代理"; exit 0; }`,
+      'fi',
+      'rm -f "$O.part"; echo DL_FAIL',
+    ].join('\n'), Math.min(600000, (maxTime * urls.length + maxTime + 20) * 1000))
+    const m = res.match(/DL_OK (\d+) (\S+)/)
+    if (!m) throw new Error('下载失败：所有下载地址都不可用，请换一个 GitHub 加速地址，或改用「从电脑上传」')
+    if (log) log(`已下载 ${(Number(m[1]) / 1024).toFixed(0)} KB（${m[2].replace(/^(https?:\/\/[^/]+).*/, '$1')}）`)
+    return Number(m[1])
+  }
+  const validTag = (t) => /^v?[0-9A-Za-z._-]{1,40}$/.test(String(t || ''))
+  const fetchRelease = async (log) => {
+    const out = `${STAGE}/version.json`
+    log && log('读取 GitHub 上的最新版本 …')
+    await deviceFetch(mirrorURLs(`${GH}/releases/latest/download/version.json`, 'version.json'), out, 20)
+    const text = await shell(`cat ${q(out)}; rm -f ${q(out)}`, 8000)
+    let v
+    try { v = JSON.parse(text) } catch (e) { throw new Error('版本信息格式错误') }
+    if (!v || !validTag(v.tag) || !v.devui || !v.ui || !/^[0-9a-f]{64}$/.test(v.devui.sha256 || '') || !/^[0-9a-f]{64}$/.test(v.ui.sha256 || '')) throw new Error('版本信息不完整')
+    return v
+  }
+  const assetURLs = (rel, name) => mirrorURLs(`${GH}/releases/download/${rel.tag}/${encodeURIComponent(name)}`, name)
+  const installOnline = async (rel, withBinary, log) => {
+    await shell(`rm -rf ${STAGE} && mkdir -p ${STAGE} && echo ok`, 8000)
+    let bin = null
+    if (withBinary) {
+      log(`下载渲染程序 ${rel.devui.version} …`)
+      await deviceFetch(assetURLs(rel, rel.devui.asset || 'u60pro-devui-aarch64'), `${STAGE}/u60pro-devui.dl`, 180, log)
+      bin = await installBinaryFromStage(`${STAGE}/u60pro-devui.dl`, rel.devui.sha256, log)
+    }
+    log(`下载页面 UI ${rel.ui.version} …`)
+    await deviceFetch(assetURLs(rel, rel.ui.asset || 'ui.tar.gz'), `${STAGE}/ui.tar.gz`, 120, log)
+    const ok = await shell([
+      `cd ${STAGE} || exit 0`,
+      `[ "$(sha256sum ui.tar.gz | cut -d" " -f1)" = ${q(rel.ui.sha256)} ] || { echo "ERR 页面包 SHA-256 不匹配"; exit 0; }`,
+      'gzip -dc ui.tar.gz > ui.tar 2>/dev/null && [ -s ui.tar ] || { echo "ERR 页面包解压失败"; exit 0; }',
+      'rm -f ui.tar.gz; echo OK',
+    ].join('\n'), 20000)
+    if (!/^OK/m.test(ok)) throw new Error((ok.match(/ERR .*/) || ['页面包校验失败'])[0].replace(/^ERR /, ''))
+    await applyUiTar(log)
+    return bin
+  }
+  const newer = (a, b) => { // a 比 b 新
+    const pa = String(a || '').replace(/^v/, '').split(/[.-]/).map((x) => parseInt(x, 10) || 0)
+    const pb = String(b || '').replace(/^v/, '').split(/[.-]/).map((x) => parseInt(x, 10) || 0)
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0)
+    return false
+  }
+
+  // ====================== 界面 ======================
+  const MODAL = `${ID}_modal`
+  const css = `
+#${MODAL} .modal{width:92%;max-width:520px;max-height:86vh;display:flex;flex-direction:column;padding:0;overflow:hidden}
+#${MODAL} .${ID}-head{display:flex;align-items:center;gap:8px;padding:14px 16px 10px}
+#${MODAL} .${ID}-head b{font-size:16px}
+#${MODAL} .${ID}-head small{opacity:.6;margin-left:auto}
+#${MODAL} .${ID}-body{overflow:auto;padding:0 16px 12px}
+#${MODAL} .${ID}-sec{margin-top:10px;padding:10px 12px;border-radius:12px;background:rgba(127,127,127,.09)}
+#${MODAL} .${ID}-sec h4{margin:0 0 8px;font-size:13px;opacity:.75;font-weight:700}
+#${MODAL} .${ID}-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px}
+#${MODAL} .${ID}-row .k{width:72px;flex:none;opacity:.7}
+#${MODAL} .${ID}-row .v{flex:1;min-width:0;overflow-wrap:anywhere}
+#${MODAL} .${ID}-dot{width:8px;height:8px;border-radius:4px;flex:none;background:#8a93a0}
+#${MODAL} .${ID}-dot.ok{background:#34c77b}#${MODAL} .${ID}-dot.warn{background:#f5a524}#${MODAL} .${ID}-dot.bad{background:#f25f5c}
+#${MODAL} .${ID}-btns{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+#${MODAL} .${ID}-btns button{flex:1 1 30%;min-width:92px;padding:9px 6px;border-radius:10px;font-size:13px}
+#${MODAL} button.${ID}-primary{background:#2f6feb;color:#fff;font-weight:700}
+#${MODAL} button.${ID}-danger{color:#e5484d}
+#${MODAL} .${ID}-src label{display:flex;align-items:center;gap:6px;font-size:13px;padding:4px 0}
+#${MODAL} .${ID}-src input[type=text]{width:100%;box-sizing:border-box;margin:4px 0;padding:7px 8px;border-radius:8px;border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;font-size:12px}
+#${MODAL} .${ID}-hint{font-size:12px;opacity:.7;line-height:1.5;margin-top:4px}
+#${MODAL} .${ID}-warn{font-size:12px;line-height:1.5;margin-top:8px;padding:8px 10px;border-radius:10px;background:rgba(245,165,36,.14)}
+#${MODAL} pre.${ID}-log{margin:10px 0 0;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.28);font-size:11px;line-height:1.5;max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+#${MODAL} .${ID}-foot{display:flex;justify-content:flex-end;padding:10px 16px;border-top:1px solid rgba(127,127,127,.18)}
+`
+  const html = `
+<div class="mask" id="${MODAL}" style="display:none;${MASK_POS};z-index:2000">
+  <div class="modal">
+    <style>${css}</style>
+    <div class="${ID}-head"><b>屏幕管理</b><span>U60 Pro 小屏</span><small>v${PLUGIN_VERSION} · UI ${UI_VERSION}</small></div>
+    <div class="${ID}-body">
+      <div class="${ID}-sec">
+        <h4>当前状态</h4>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="bin"></span><span class="k">屏幕程序</span><span class="v" data-v="bin">读取中…</span></div>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="ui"></span><span class="k">页面 UI</span><span class="v" data-v="ui">读取中…</span></div>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="datad"></span><span class="k">数据后端</span><span class="v" data-v="datad">读取中…</span></div>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="boot"></span><span class="k">开机自启</span><span class="v" data-v="boot">读取中…</span></div>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="customs"></span><span class="k">小海关</span><span class="v" data-v="customs">读取中…</span></div>
+        <div class="${ID}-row"><span class="${ID}-dot" data-dot="clash"></span><span class="k">Clash</span><span class="v" data-v="clash">读取中…</span></div>
+        <div class="${ID}-warn" data-v="legacy" style="display:none"></div>
+      </div>
+
+      <div class="${ID}-sec ${ID}-src">
+        <h4>安装 / 更新</h4>
+        <label><input type="radio" name="${ID}_src" value="online"> 从 GitHub 在线更新（推荐，不需要电脑）</label>
+        <div data-box="online" style="display:none;padding-left:22px">
+          <div class="${ID}-hint" data-v="relinfo">点「检查更新」查看最新版本。渲染程序和页面由 GitHub Actions 从源码构建，下载后校验 SHA-256。</div>
+          <input type="text" id="${ID}_gh" placeholder="GitHub 加速地址，例如 https://gh-proxy.com/（留空 = 直连）" autocomplete="off" spellcheck="false">
+          <div class="${ID}-btns"><button class="btn" data-act="check">检查更新</button></div>
+        </div>
+        <label><input type="radio" name="${ID}_src" value="keep"> 保留设备上现有的渲染程序，只更新页面 UI</label>
+        <label><input type="radio" name="${ID}_src" value="file"> 从电脑上传渲染程序（推荐扩展版 u60pro-devui-aarch64）</label>
+        <div data-box="file" style="display:none;padding-left:22px">
+          <input type="file" id="${ID}_file">
+          <div class="${ID}-hint" data-v="fileinfo">选择随插件提供的 dist/u60pro-devui-aarch64</div>
+        </div>
+        <label><input type="radio" name="${ID}_src" value="url"> 从下载链接安装</label>
+        <div data-box="url" style="display:none;padding-left:22px">
+          <input type="text" id="${ID}_url" placeholder="https://…/u60pro-devui-aarch64" autocomplete="off" spellcheck="false">
+          <input type="text" id="${ID}_sha" placeholder="SHA-256（可选，强烈建议填写）" autocomplete="off" spellcheck="false">
+          <div class="${ID}-hint">自定义链接的文件安全由你自行确认。<a href="javascript:void 0" data-act="preset">填入 remix 原版地址</a>（原版不支持小海关页）</div>
+        </div>
+        <div class="${ID}-btns"><button class="btn ${ID}-primary" data-act="install">安装 / 更新</button></div>
+        <div class="${ID}-hint">会先停原厂屏幕再启动新程序；启动失败自动回退。在线更新时页面 UI 也用 Release 里的最新版，其余方式使用插件内置的页面（不需要联网）。</div>
+      </div>
+
+      <div class="${ID}-sec">
+        <h4>运行控制</h4>
+        <div class="${ID}-btns">
+          <button class="btn" data-act="start">启动</button>
+          <button class="btn" data-act="restart">重启</button>
+          <button class="btn" data-act="stop">停止（恢复原厂）</button>
+          <button class="btn" data-act="boot">开机自启</button>
+          <button class="btn" data-act="ui">只重装页面</button>
+          <button class="btn" data-act="refresh">刷新状态</button>
+        </div>
+      </div>
+
+      <div class="${ID}-sec">
+        <h4>维护</h4>
+        <div class="${ID}-btns">
+          <button class="btn" data-act="diag">诊断信息</button>
+          <button class="btn" data-act="legacy">清理旧版自启</button>
+          <button class="btn ${ID}-danger" data-act="uninstall">卸载</button>
+        </div>
+      </div>
+      <pre class="${ID}-log" data-v="log">就绪。</pre>
+    </div>
+    <div class="${ID}-foot"><button class="btn" data-act="close">关闭</button></div>
+  </div>
+</div>`
+
+  let state = {}
+  let busy = false
+  let root = null
+  const $ = (sel) => root.querySelector(sel)
+  const setText = (key, text) => { const el = $(`[data-v="${key}"]`); if (el) el.textContent = text }
+  const setDot = (key, cls) => { const el = $(`[data-dot="${key}"]`); if (el) el.className = `${ID}-dot ${cls || ''}` }
+  const log = (line) => {
+    const el = $('[data-v="log"]')
+    if (!el) return
+    const t = new Date().toTimeString().slice(0, 8)
+    el.textContent = (el.textContent === '就绪。' ? '' : el.textContent + '\n') + `[${t}] ${line}`
+    el.scrollTop = el.scrollHeight
+  }
+
+  const askConfirm = (title, lines, okText = '确定', danger = false) => new Promise((resolve) => {
+    const id = `${ID}_confirm`
+    document.getElementById(id)?.remove()
+    const mask = document.createElement('div')
+    mask.className = 'mask'
+    mask.id = id
+    mask.style.cssText = `${MASK_POS};z-index:2001`
+    const box = document.createElement('div')
+    box.className = 'modal'
+    box.style.cssText = 'width:88%;max-width:420px;max-height:86vh;overflow:auto;padding:16px'
+    const h = document.createElement('div')
+    h.className = 'title'
+    h.style.cssText = 'margin-bottom:8px;font-weight:700'
+    h.textContent = title
+    box.appendChild(h)
+    lines.forEach((l) => {
+      const p = document.createElement('div')
+      p.style.cssText = 'font-size:13px;line-height:1.6;margin:4px 0'
+      p.textContent = l
+      box.appendChild(p)
+    })
+    const row = document.createElement('div')
+    row.style.cssText = 'display:flex;gap:8px;margin-top:14px'
+    const no = document.createElement('button'); no.className = 'btn'; no.textContent = '取消'; no.style.flex = '1'
+    const ok = document.createElement('button'); ok.className = 'btn'; ok.textContent = okText; ok.style.cssText = `flex:1.4;font-weight:700;color:#fff;background:${danger ? '#e5484d' : '#2f6feb'}`
+    row.append(no, ok)
+    box.appendChild(row)
+    mask.appendChild(box)
+    document.body.appendChild(mask)
+    const done = (v) => { mask.remove(); resolve(v) }
+    no.onclick = () => done(false)
+    ok.onclick = () => done(true)
+  })
+
+  const render = (s) => {
+    state = s
+    const run = s.RUN === '1'
+    if (s.BIN !== '1') { setDot('bin', 'bad'); setText('bin', '未安装') }
+    else {
+      setDot('bin', run ? 'ok' : 'warn')
+      setText('bin', `${run ? '运行中' : '未运行'} · ${XP_LABEL[s.BIN_XP] || XP_LABEL[0]} · ${s.BIN_KB} KB · ${s.BIN_SHA || '-'}${s.OEM === '1' ? ' · 原厂屏幕运行中' : ''}`)
+    }
+    const target = lastRel ? lastRel.ui.version : UI_VERSION
+    const uiOk = s.UI_VER === target || (!lastRel && newer(String(s.UI_VER).replace(/^clean-/, ''), UI_VERSION.replace(/^clean-/, '')))
+    setDot('ui', s.UI_PAGES > 0 ? (uiOk ? 'ok' : 'warn') : 'bad')
+    setText('ui', s.UI_PAGES > 0 ? `${s.UI_VER || '其他版本'}${uiOk ? '（最新）' : ` → 可更新到 ${target}`} · ${s.UI_PAGES} 个主页面` : '未安装')
+    const builtin = String(s.DATAD_EXE || '').split(/\s+/).filter(Boolean).filter((p) => p !== LEGACY_DATAD)
+    const legacyRunning = String(s.DATAD_EXE || '').includes(LEGACY_DATAD)
+    setDot('datad', s.DATAD_HTTP === '200' ? 'ok' : 'bad')
+    setText('datad', s.DATAD_HTTP === '200'
+      ? `9460 正常${builtin.length ? '（内置 datad）' : legacyRunning ? '（旧版插件 datad）' : ''}`
+      : `9460 无响应，datad 未运行${String(s.DATAD_EXE || '').trim() ? '（进程在但未监听）' : ''}：屏幕不会有数据。重启设备通常可恢复；重启后仍无响应请把「诊断信息」发给作者`)
+    setDot('boot', s.BOOT === '1' ? 'ok' : '')
+    setText('boot', s.BOOT === '1' ? '已开启（ufi_tools_boot.sh，开机约 20 秒后接管）' : '未开启')
+    const bootBtn = $('[data-act="boot"]'); if (bootBtn) bootBtn.textContent = s.BOOT === '1' ? '关闭开机自启' : '开启开机自启'
+    setDot('customs', s.CUSTOMS === '1' ? (s.BIN_XP === '2' ? 'ok' : 'warn') : '')
+    setText('customs', s.CUSTOMS === '1'
+      ? (s.BIN_XP === '2' ? '已安装 · 屏幕「更多功能 → 小海关」可直接控制' : '已安装 · 需更新扩展渲染程序才能在屏幕上控制')
+      : '未安装（安装后屏幕会自动出现小海关入口）')
+    setDot('clash', s.CLASH === '1' ? (s.BIN_XP === '2' ? 'ok' : 'warn') : '')
+    setText('clash', s.CLASH === '1'
+      ? (s.BIN_XP === '2' ? '已安装 · 屏幕「更多功能 → Clash」可切换节点、接管与订阅' : '已安装 · 需更新扩展渲染程序才能在屏幕上控制')
+      : '未安装「Clash 管理」插件（安装后屏幕会自动出现 Clash 入口）')
+    const legacy = []
+    if (Number(s.RC_DEVUI) > 0) legacy.push(`/etc/rc.local 中有 ${s.RC_DEVUI} 行旧版屏幕自启`)
+    if (Number(s.RC_DATAD) > 0) legacy.push(`/etc/rc.local 中有旧版 datad 自启${builtin.length ? '（已检测到内置 datad，可清理）' : '（未检测到内置 datad，暂时保留）'}`)
+    if (s.LEGACY_DATAD === '1') legacy.push('存在旧版插件安装的 /data/plugins/zwrt-datad')
+    const lw = $('[data-v="legacy"]')
+    if (lw) { lw.style.display = legacy.length ? '' : 'none'; lw.textContent = legacy.length ? `检测到 0.3.x 旧版残留：${legacy.join('；')}。可点「清理旧版自启」。` : '' }
+    if (s.ARCH && s.ARCH !== 'aarch64') log(`警告：设备架构为 ${s.ARCH}，本插件仅适配 AArch64 的 U60 Pro`)
+  }
+
+  const refresh = async () => {
+    const s = kv(await shell(STATUS_SCRIPT, 15000))
+    render(s)
+    return s
+  }
+
+  const lock = (fn) => async () => {
+    if (busy) return toast('有操作正在进行，请稍候', 'pink')
+    busy = true
+    root.querySelectorAll('button').forEach((b) => { if (b.dataset.act !== 'close') b.disabled = true })
+    try { await fn() }
+    catch (e) { const msg = e && e.message || String(e); log(`失败：${msg}`); toast(`操作失败：${msg}`, 'red', 5000) }
+    finally {
+      busy = false
+      root.querySelectorAll('button').forEach((b) => { b.disabled = false })
+      refresh().catch(() => {})
+    }
+  }
+
+  let lastRel = null
+  const saveGh = () => {
+    const v = ($(`#${ID}_gh`).value || '').trim()
+    if (v && !/^https?:\/\/[A-Za-z0-9._:~%/-]+\/$/.test(v)) throw new Error('GitHub 加速地址应形如 https://gh-proxy.com/（以 / 结尾）')
+    lsSet(LS_GH, v || '-')
+  }
+  const showRelease = (rel, s) => {
+    lastRel = rel
+    const cur = s || state
+    const parts = [`最新 ${rel.tag}：渲染程序 ${rel.devui.version}`, `页面 ${rel.ui.version}`]
+    if (rel.plugin && rel.plugin.version) parts.push(`插件 ${rel.plugin.version}${newer(rel.plugin.version, PLUGIN_VERSION) ? '（比当前新，请下载新 txt 重装插件）' : ''}`)
+    parts.push(cur.BIN_SHA && rel.devui.sha256.startsWith(cur.BIN_SHA) ? '设备上的渲染程序已是最新' : '设备上的渲染程序可更新')
+    setText('relinfo', parts.join(' · '))
+    render(cur)
+  }
+  const srcValue = () => (root.querySelector(`input[name="${ID}_src"]:checked`) || {}).value || 'keep'
+  const syncSrc = () => {
+    const v = srcValue()
+    lsSet(LS_SRC, v)
+    root.querySelectorAll('[data-box]').forEach((b) => { b.style.display = b.dataset.box === v ? '' : 'none' })
+  }
+
+  let picked = null
+  const inspectFile = async (file) => {
+    picked = null
+    if (!file) return setText('fileinfo', '未选择文件')
+    const buf = new Uint8Array(await readBuffer(file))
+    const isElf = buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46
+    const arm64 = buf[4] === 2 && buf[18] === 0xb7 && buf[19] === 0
+    if (!isElf || !arm64) return setText('fileinfo', `「${file.name}」不是 AArch64 ELF 程序，不能使用`)
+    const findMarker = (text) => {
+      const marker = new TextEncoder().encode(text)
+      for (let i = 0; i + marker.length <= buf.length; i++) {
+        if (buf[i] !== marker[0]) continue
+        let j = 1
+        while (j < marker.length && buf[i + j] === marker[j]) j++
+        if (j === marker.length) return true
+      }
+      return false
+    }
+    const xp = findMarker(XP_MARKER) ? 2 : findMarker(XP_MARKER_V1) ? 1 : 0
+    picked = { file, xp }
+    setText('fileinfo', `${file.name} · ${(file.size / 1048576).toFixed(2)} MB · ${XP_LABEL[xp]}`)
+  }
+
+  const doInstall = async () => {
+    const s = await refresh()
+    if (s.ARCH !== 'aarch64') throw new Error(`不支持的架构：${s.ARCH || '未知'}`)
+    if (s.TAR !== '1') throw new Error('设备缺少 tar')
+    if (Number(s.FREE_KB) && Number(s.FREE_KB) < 8192) throw new Error('/data 剩余空间不足 8 MB')
+    const src = srcValue()
+    let binPlan = '保留现有渲染程序'
+    let rel = null
+    if (src === 'online') {
+      if (s.CURL !== '1') throw new Error('设备缺少 curl，无法在线更新')
+      if (s.GZIP !== '1') throw new Error('设备缺少 gzip，无法解压在线页面包')
+      saveGh()
+      rel = await fetchRelease(log)
+      showRelease(rel, s)
+      binPlan = `在线下载 ${rel.devui.version}（${rel.tag}，校验 SHA-256）`
+    } else if (src === 'file') {
+      if (!picked) throw new Error('请先选择有效的渲染程序文件')
+      binPlan = `上传 ${picked.file.name}（${XP_LABEL[picked.xp]}）`
+    } else if (src === 'url') {
+      const url = ($(`#${ID}_url`).value || '').trim()
+      const sha = ($(`#${ID}_sha`).value || '').trim().toLowerCase()
+      if (!/^https?:\/\/[^\s'"]+$/i.test(url)) throw new Error('请填写有效的 http/https 下载链接')
+      if (sha && !/^[0-9a-f]{64}$/.test(sha)) throw new Error('SHA-256 应为 64 位十六进制')
+      lsSet(LS_URL, url); lsSet(LS_SHA, sha)
+      binPlan = `下载 ${url}${sha ? '（校验 SHA-256）' : '（未校验）'}`
+    } else if (s.BIN !== '1') {
+      throw new Error('设备上还没有渲染程序：请选择「上传」或「下载链接」')
+    }
+    if (s.DATAD_HTTP !== '200') log('提示：datad（9460）当前无响应，屏幕可能暂时没有数据')
+    const ok = await askConfirm('安装 / 更新屏幕', [
+      `渲染程序：${binPlan}`,
+      `页面 UI：${rel ? rel.ui.version : UI_VERSION}（保留锁屏密码、屏幕设置与你自己的自定义页面）`,
+      rel && rel.plugin && newer(rel.plugin.version, PLUGIN_VERSION) ? `另有新版插件 ${rel.plugin.version}：装完后可到 ${GH}/releases 下载新的 txt 重新安装。` : '',
+      '安装时会停止原厂屏幕程序并启动新程序；若启动失败会自动回退。',
+      'datad 由 UFI-TOOLS 1.0 内置提供，本插件不会改动它。',
+    ].filter(Boolean), '开始安装')
+    if (!ok) return
+    let replaced = false
+    if (src === 'online') {
+      await installOnline(rel, true, log)
+      replaced = true
+    } else if (src === 'file') {
+      log(`上传渲染程序 ${picked.file.name} …`)
+      await shell(`mkdir -p ${STAGE} && echo ok`, 5000)
+      await upload(picked.file, 'u60pro-devui.upload', STAGE)
+      await installBinaryFromStage(`${STAGE}/u60pro-devui.upload`, '', log)
+      replaced = true
+    } else if (src === 'url') {
+      await downloadBinary(lsGet(LS_URL), lsGet(LS_SHA), log)
+      replaced = true
+    }
+    if (src !== 'online') await installUi(log)
+    log('写入启动脚本 …')
+    await writeStartScript()
+    log('启动屏幕程序 …')
+    try {
+      await startRenderer()
+    } catch (e) {
+      if (replaced) {
+        log('新程序启动失败，回退到上一个版本 …')
+        await shell(`[ -f ${DIR}/.u60pro-devui.bak ] && mv -f ${DIR}/.u60pro-devui.bak ${BIN}; echo ok`, 8000)
+        try { await startRenderer(); log('已回退并启动旧版本'); throw new Error('新程序无法启动，已回退旧版本') } catch (e2) { if (/已回退/.test(e2.message)) throw e2 }
+      }
+      await restoreOem()
+      throw new Error('屏幕程序无法启动，已恢复原厂屏幕')
+    }
+    log('屏幕程序已启动，请看一眼设备屏幕')
+    const s2 = await refresh()
+    if (s2.BOOT === '1') {
+      await setBoot(true)
+    } else {
+      const yes = await askConfirm('屏幕显示正常吗？', [
+        '如果设备小屏已经显示新界面，点「写入开机自启」。',
+        '如果黑屏或卡住，点「取消」后再点「停止（恢复原厂）」；未写自启前重启设备也会回到原厂屏幕。',
+        Number(s2.RC_DEVUI) > 0 ? '旧版写在 /etc/rc.local 的屏幕自启会一并移除，改用 1.0 的 ufi_tools_boot.sh。' : '',
+      ].filter(Boolean), '写入开机自启')
+      await setBoot(yes)
+      log(yes ? '已写入开机自启（/data/plugins/ufi_tools_boot.sh）' : '未写入开机自启；确认正常后可点「开启开机自启」')
+    }
+    toast('屏幕安装完成', 'green')
+  }
+
+  const doDiag = async () => {
+    const out = await shell([
+      STATUS_SCRIPT,
+      'echo; echo "== 渲染器日志 =="; tail -n 30 /tmp/u60pro-devui.log 2>/dev/null',
+      'echo; echo "== 启动日志 =="; tail -n 20 /tmp/u60pro-devui-boot.log 2>/dev/null',
+      'echo; echo "== 功能页检测 =="; tail -n 20 /data/plugins/u60pro-devui/plugin-detect.log 2>/dev/null',
+      'echo; echo "== 扩展页 =="; ls -la /tmp/devui-x 2>/dev/null; tail -n 8 /tmp/devui-x/*.log 2>/dev/null',
+      `echo; echo "== 启动项 =="; grep -n -e u60pro -e datad ${BOOT} /etc/rc.local 2>/dev/null; grep -l datad /etc/init.d/* 2>/dev/null`,
+      'echo; echo "== datad =="; netstat -lntp 2>/dev/null | grep -e ":9460 " -e datad; ps w 2>/dev/null | grep -i datad | grep -v grep; ls -l /proc/[0-9]*/exe 2>/dev/null | grep -i datad',
+      'echo; echo "== 系统日志 =="; logread 2>/dev/null | grep -i -e datad -e segfault | tail -n 15; dmesg 2>/dev/null | grep -i -e datad -e segfault -e "killed process" | tail -n 8',
+      `echo; echo "== 文件 =="; ls -la ${DIR} ${UI} ${UI}/functions 2>/dev/null`,
+    ].join('\n'), 20000)
+    const id = `${ID}_diag`
+    document.getElementById(id)?.remove()
+    const mask = document.createElement('div')
+    mask.className = 'mask'; mask.id = id
+    mask.style.cssText = `${MASK_POS};z-index:2001`
+    const box = document.createElement('div')
+    box.className = 'modal'
+    box.style.cssText = 'width:94%;max-width:640px;max-height:86vh;display:flex;flex-direction:column;gap:10px;padding:14px'
+    const ta = document.createElement('textarea')
+    ta.readOnly = true
+    ta.style.cssText = 'width:100%;height:60vh;box-sizing:border-box;font:11px/1.45 monospace;white-space:pre;overflow:auto;background:rgba(0,0,0,.25);color:inherit;border-radius:8px;padding:8px'
+    ta.value = `U60 屏幕管理 ${PLUGIN_VERSION} · UI ${UI_VERSION}\n${out}`
+    const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:8px'
+    const cp = document.createElement('button'); cp.className = 'btn'; cp.textContent = '复制'; cp.style.flex = '1'
+    const cl = document.createElement('button'); cl.className = 'btn'; cl.textContent = '关闭'; cl.style.flex = '1'
+    cp.onclick = async () => {
+      try { await navigator.clipboard.writeText(ta.value); toast('已复制', 'green') }
+      catch (e) { ta.focus(); ta.select(); try { document.execCommand('copy'); toast('已复制', 'green') } catch (e2) { toast('请长按手动复制', 'pink') } }
+    }
+    cl.onclick = () => mask.remove()
+    row.append(cp, cl); box.append(ta, row); mask.appendChild(box); document.body.appendChild(mask)
+  }
+
+  const doLegacy = async () => {
+    const s = await refresh()
+    const builtin = String(s.DATAD_EXE || '').split(/\s+/).filter(Boolean).some((p) => p !== LEGACY_DATAD)
+    const items = []
+    if (Number(s.RC_DEVUI) > 0) items.push('删除 /etc/rc.local 中旧版屏幕自启行（改由 ufi_tools_boot.sh 启动）')
+    if (Number(s.RC_DATAD) > 0 && builtin) items.push('删除 /etc/rc.local 中旧版 datad 自启行（已检测到内置 datad）')
+    const legacyIdle = s.LEGACY_DATAD === '1' && builtin && !String(s.DATAD_EXE || '').includes(LEGACY_DATAD)
+    if (legacyIdle) items.push('删除未在使用的旧版 datad 目录 /data/plugins/zwrt-datad')
+    if (!items.length) {
+      log(Number(s.RC_DATAD) > 0 && !builtin ? '旧版 datad 自启仍在使用（未检测到内置 datad），已保留' : '没有需要清理的旧版残留')
+      return
+    }
+    if (!await askConfirm('清理旧版残留', items, '清理')) return
+    const cmd = [RC_DEVUI_CLEAN]
+    if (Number(s.RC_DATAD) > 0 && builtin) cmd.push("sed -i '/u60pro_devui_datad/d' /etc/rc.local")
+    if (legacyIdle) cmd.push('rm -rf /data/plugins/zwrt-datad')
+    cmd.push('echo ok')
+    await shell(cmd.join('\n'), 10000)
+    log('旧版残留已清理')
+  }
+
+  const doUninstall = async () => {
+    const ok = await askConfirm('卸载屏幕管理', [
+      '1. 停止社区屏幕程序并恢复原厂屏幕；',
+      '2. 删除开机自启行（ufi_tools_boot.sh 与 rc.local 中的屏幕自启）；',
+      `3. 删除 ${DIR}（含渲染程序、页面、锁屏密码、你放进 ui/functions 的自定义页）；`,
+      '4. 不会触碰 datad、小海关或其他插件。',
+      '插件本身请在插件商店中移除。',
+    ], '确认卸载', true)
+    if (!ok) return
+    await restoreOem()
+    await setBoot(false)
+    await shell(`rm -rf ${DIR} /tmp/devui-x /tmp/u60pro-devui.log /tmp/u60pro-devui-boot.log; echo ok`, 15000)
+    log('已卸载并恢复原厂屏幕')
+    toast('已卸载，原厂屏幕已恢复', 'green')
+  }
+
+  const actions = {
+    install: lock(doInstall),
+    ui: lock(async () => {
+      if (!await askConfirm('重装页面 UI', [`安装内置页面 ${UI_VERSION}，保留锁屏密码和你自己的自定义页面。`], '重装')) return
+      await installUi(log)
+      toast('页面 UI 已更新，屏幕约 1 秒后刷新', 'green')
+    }),
+    start: lock(async () => {
+      if (state.BIN !== '1') throw new Error('请先安装渲染程序')
+      await writeStartScript(); await startRenderer(); log('已启动')
+    }),
+    restart: lock(async () => {
+      if (state.BIN !== '1') throw new Error('请先安装渲染程序')
+      await writeStartScript(); await startRenderer(); log('已重启')
+    }),
+    stop: lock(async () => { await restoreOem(); log('已停止，原厂屏幕已恢复（开机自启设置未改变）') }),
+    boot: lock(async () => {
+      const on = state.BOOT !== '1'
+      if (on && state.BIN !== '1') throw new Error('请先安装渲染程序')
+      if (on) await writeStartScript()
+      await setBoot(on)
+      log(on ? '已开启开机自启' : '已关闭开机自启')
+    }),
+    refresh: lock(async () => { log('已刷新') }),
+    check: lock(async () => {
+      saveGh()
+      const rel = await fetchRelease(log)
+      showRelease(rel)
+      log(`GitHub 最新版本 ${rel.tag}`)
+    }),
+    diag: lock(doDiag),
+    legacy: lock(doLegacy),
+    uninstall: lock(doUninstall),
+    preset: () => {
+      $(`#${ID}_url`).value = PRESETS.remix.url
+      $(`#${ID}_sha`).value = PRESETS.remix.sha
+    },
+    close: () => { if (typeof closeModal === 'function') closeModal(`#${MODAL}`); else root.style.display = 'none' },
+  }
+
+  const open = () => {
+    if (!root) {
+      document.getElementById(MODAL)?.remove()
+      const wrap = document.createElement('div')
+      wrap.innerHTML = html.trim()
+      root = wrap.firstElementChild
+      document.body.appendChild(root)
+      root.addEventListener('click', (e) => {
+        const t = e.target.closest('[data-act]')
+        if (t && actions[t.dataset.act]) { e.preventDefault(); actions[t.dataset.act]() }
+      })
+      root.querySelectorAll(`input[name="${ID}_src"]`).forEach((r) => { r.addEventListener('change', syncSrc) })
+      const saved = lsGet(LS_SRC) || 'online'
+      const radio = root.querySelector(`input[name="${ID}_src"][value="${saved}"]`) || root.querySelector(`input[name="${ID}_src"][value="online"]`)
+      radio.checked = true
+      $(`#${ID}_gh`).value = ghProxy()
+      $(`#${ID}_url`).value = lsGet(LS_URL)
+      $(`#${ID}_sha`).value = lsGet(LS_SHA)
+      $(`#${ID}_file`).addEventListener('change', (e) => { inspectFile(e.target.files && e.target.files[0]).catch((err) => setText('fileinfo', String(err))) })
+      syncSrc()
+    }
+    if (typeof showModal === 'function') showModal(`#${MODAL}`)
+    else root.style.display = 'flex'
+    refresh().catch((e) => { log(`读取状态失败：${e.message || e}`) })
+  }
+
+  const waitFor = async (selector, timeout = 10000) => {
+    const until = Date.now() + timeout
+    let node = document.querySelector(selector)
+    while (!node && Date.now() < until) { await sleep(150); node = document.querySelector(selector) }
+    return node
+  }
+
+  const mount = async () => {
+    const box = await waitFor('.functions-container .collapse_box', 30000)
+    if (!box) { console.warn(`[${ID}] 功能列表未就绪，未添加入口`); return }
+    document.getElementById(`${ID}_btn`)?.remove()
+    const btn = document.createElement('button')
+    btn.id = `${ID}_btn`
+    btn.className = 'btn'
+    btn.type = 'button'
+    btn.textContent = '屏幕管理'
+    btn.addEventListener('click', open)
+    box.appendChild(btn)
+  }
+
+  mount().catch((e) => console.error(`[${ID}] 初始化失败`, e))
+})()
+</script>

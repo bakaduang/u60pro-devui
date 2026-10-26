@@ -1,0 +1,104 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.13.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check device scripts (LF, BusyBox ash syntax)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq busybox >/dev/null
+          bad=0
+          for f in ui/functions/*.sh renderer/build.sh; do
+            if grep -q $'\r' "$f"; then echo "::error file=$f::CRLF line endings"; bad=1; fi
+          done
+          for f in ui/functions/*.sh; do
+            busybox sh -n "$f" || { echo "::error file=$f::BusyBox ash syntax error"; bad=1; }
+          done
+          exit $bad
+
+      - name: Cache toolchain and dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/zig
+            work/litehtml
+            work/freetype
+            work/deps
+          key: deps-zig${{ env.ZIG_VERSION }}-lh0.10-ft2.13.3-v1
+
+      - name: Install zig
+        run: |
+          if [ ! -x ~/zig/zig ]; then
+            mkdir -p ~/zig
+            curl -fsSL --retry 3 "https://ziglang.org/download/$ZIG_VERSION/zig-linux-x86_64-$ZIG_VERSION.tar.xz" | tar -xJ --strip-components=1 -C ~/zig
+          fi
+          ~/zig/zig version
+
+      - name: Build renderer
+        run: ZIG=~/zig/zig bash renderer/build.sh work work/u60pro-devui
+
+      - name: Build plugin and release assets
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          node plugin/build-plugin.js work/u60pro-devui dist
+          cat dist/version.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: u60pro-devui-clean
+          path: dist/*
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          WANT="v$(node -p "require('./version.config.json').plugin")"
+          [ "$TAG" = "$WANT" ] || { echo "::error::tag $TAG does not match version.config.json ($WANT)"; exit 1; }
+          node -e '
+            const v = require("./dist/version.json")
+            const lines = [
+              `- 插件：${v.plugin.version}（${v.plugin.asset}）`,
+              `- 渲染程序：${v.devui.version} — ${v.devui.notes}`,
+              `- 页面 UI：${v.ui.version} — ${v.ui.notes}`,
+              "",
+              "在 UFI-TOOLS「屏幕管理」里选「从 GitHub 在线更新」即可安装，不需要电脑上传。",
+              "",
+              "```", require("fs").readFileSync("dist/SHA256SUMS", "utf8").trim(), "```",
+            ]
+            require("fs").writeFileSync("notes.md", lines.join("\n") + "\n")'
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --latest
+          fi
+
+      - name: Update dist branch (jsDelivr mirror)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -rf /tmp/distbr && mkdir /tmp/distbr && cp dist/* /tmp/distbr/
+          cd /tmp/distbr
+          git init -q -b dist && git add -A && git commit -q -m "dist ${GITHUB_REF_NAME}"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" dist
+          for f in *; do curl -fsS -m 20 "https://purge.jsdelivr.net/gh/${GITHUB_REPOSITORY}@dist/$f" >/dev/null || true; done

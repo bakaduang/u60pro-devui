@@ -1,0 +1,1141 @@
+diff --git a/include/xpage.h b/include/xpage.h
+new file mode 100644
+index 0000000..4ca708d
+--- /dev/null
++++ b/include/xpage.h
+@@ -0,0 +1,56 @@
++/*
++ * xpage.h - adapter-backed custom function pages for u60pro-devui.
++ *
++ * A page ui/functions/<name>.html may ship a sibling shell adapter
++ * ui/functions/<name>.sh. While that page is on screen the renderer runs
++ * `sh <name>.sh status` in the background and exposes every KEY=VALUE line it
++ * prints as the template token {{X_KEY}}. Anchors `act:x:<verb>` (and the
++ * two-tap confirm form `act:xc:<verb>`) run `sh <name>.sh <verb>` in the
++ * background, then refresh the status. No call ever blocks the UI thread.
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#ifndef U60PRO_XPAGE_H
++#define U60PRO_XPAGE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define XPAGE_API_MARKER "DEVUI-XPAGE-API-2"
++#define XPAGE_RUN_DIR    "/tmp/devui-x"
++
++/* Call once at startup (creates the run dir, records the API marker). */
++void xpage_init(void);
++
++/* Bind the template-token store to the page being rendered. Pages without an
++ * adapter unbind it, so {{X_*}} tokens render empty everywhere else. */
++void xpage_prepare(const char *page_path);
++
++/* Periodic work for the visible page: reload fresh status output, collect
++ * finished-action messages, and schedule the next background status run.
++ * Returns 1 when the page should be re-rendered. `toast` receives a message
++ * (HTML-escaped) when an action finished. */
++int xpage_tick(const char *page_path, uint32_t now_ms, int screen_on,
++               char *toast, size_t toast_cap);
++
++/* Handle act:x:<verb> (confirm=0) or act:xc:<verb> (confirm=1).
++ * Always fills `toast` with user feedback. Returns 1 if a command started. */
++int xpage_action(const char *page_path, const char *verb, int confirm,
++                 uint32_t now_ms, const char *posix_tz,
++                 char *toast, size_t toast_cap);
++
++/* Renderer-local actions (API 2): act:xv:<view> and act:xp:<list>:<op>.
++ * Returns 1 when the page should be re-rendered, 2 when the view changed
++ * (scroll back to top). No shell is involved. */
++int xpage_local(const char *page_path, const char *act, uint32_t now_ms);
++
++/* Kick an immediate status refresh (page just opened). */
++void xpage_opened(const char *page_path, uint32_t now_ms);
++
++/* Template fallback for tokens starting with "X_" or "XS_"; never NULL. */
++const char *xpage_lookup(const char *key, size_t key_len);
++
++/* 1 if `page_path` is a function page that has a readable adapter. */
++int xpage_has_adapter(const char *page_path);
++
++#endif /* U60PRO_XPAGE_H */
+diff --git a/src/htmlmain.c b/src/htmlmain.c
+index 800970b..87fd2d0 100644
+--- a/src/htmlmain.c
++++ b/src/htmlmain.c
+@@ -15,6 +15,7 @@
+ #include "key_input.h"
+ #include "backlight.h"
+ #include "devui_ext.h"
++#include "xpage.h"
+ 
+ #include <arpa/inet.h>
+ #include <dirent.h>
+@@ -132,9 +133,10 @@ static void devui_posix_tz(char *out, size_t outlen)
+     snprintf(out, outlen, "UTC%c%d:%02d", sign, abs_minutes / 60, abs_minutes % 60);
+ }
+ 
+-/* Optional service pages under ui/functions/.  These fixed paths intentionally
+- * avoid a generic "run shell from HTML" action: custom pages remain data-only,
+- * while known local services get a small, auditable control surface. */
++/* Optional service pages under ui/functions/.  Known services keep these fixed,
++ * auditable control paths. Other pages can only reach their own sibling adapter
++ * (functions/<name>.sh, see xpage.c) with a whitelisted verb; HTML still cannot
++ * run arbitrary commands. */
+ #define TAILSCALE_ACTION_LOG "/tmp/devui-tailscale-action.log"
+ #define MIHOMO_ACTION_LOG "/tmp/devui-mihomo-action.log"
+ #define WIREGUARD_ACTION_LOG "/tmp/devui-wireguard-action.log"
+@@ -259,7 +261,7 @@ static char g_fm_band[32] = "-", g_fm_signal[16] = "-", g_fm_plmn[16] = "-";
+ static char g_fm_detect_source[32] = "none", g_fm_detect_reason[128] = "not checked";
+ static char g_fm_confirm_pin[8], g_fm_switch_pin[8];
+ static uint32_t g_fm_refresh_at, g_fm_confirm_until, g_fm_switch_until;
+-static char g_toast[48];
++static char g_toast[96];
+ static uint32_t g_toast_until;
+ static char g_op_selected[8];
+ static uint32_t g_op_confirm_until;
+@@ -631,9 +633,11 @@ static char *apply_template(const char *tmpl, struct kv *t, int n)
+             const char *end = strstr(p + 2, "}}");
+             if (end) {
+                 int kl = (int)(end - (p + 2));
+-                const char *v = "";
++                const char *v = NULL;
+                 for (int i = 0; i < n; i++)
+                     if ((int)strlen(t[i].k) == kl && strncmp(t[i].k, p + 2, kl) == 0) { v = t[i].v; break; }
++                if (!v) v = p[2] == 'X' ? xpage_lookup(p + 2, (size_t)kl) : "";
++                if (!v) v = "";
+                 size_t vl = strlen(v);
+                 if (o + vl < sizeof(out) - 1) { memcpy(out + o, v, vl); o += vl; }
+                 else {
+@@ -2302,6 +2306,50 @@ static int subpage_name_ok(const char *name)
+     return l > 5 && strcmp(name + l - 5, ".html") == 0;
+ }
+ 
++/* <meta name="NAME" content="VALUE"> from an HTML string (first match). */
++static int function_meta_from_html(const char *html, const char *name, char *dst, size_t cap)
++{
++    char needle[64];
++    const char *p, *tag_end, *c, *v;
++    char q;
++    size_t l;
++    if (!html || !name || !dst || cap == 0) return 0;
++    dst[0] = 0;
++    for (int quote = 0; quote < 2; quote++) {
++        snprintf(needle, sizeof needle, quote ? "name='%s'" : "name=\"%s\"", name);
++        p = strcasestr(html, needle);
++        if (!p) continue;
++        tag_end = strchr(p, '>');
++        c = strcasestr(p, "content=");
++        if (!c || (tag_end && c > tag_end)) continue;
++        c += 8;
++        q = *c;
++        if (q != '"' && q != '\'') continue;
++        v = c + 1;
++        const char *e = strchr(v, q);
++        if (!e || (tag_end && e > tag_end)) continue;
++        l = (size_t)(e - v);
++        if (l >= cap) {
++            l = cap - 1;
++            while (l > 0 && ((unsigned char)v[l] & 0xC0) == 0x80) l--;
++        }
++        memcpy(dst, v, l);
++        dst[l] = 0;
++        return dst[0] != 0;
++    }
++    return 0;
++}
++
++static int function_meta_from_file(const char *path, const char *name, char *dst, size_t cap)
++{
++    char *html = read_file(path);
++    int ok;
++    if (!html) { if (dst && cap) dst[0] = 0; return 0; }
++    ok = function_meta_from_html(html, name, dst, cap);
++    free(html);
++    return ok;
++}
++
+ struct function_detection {
+     int visible;
+     char reason[48];
+@@ -2545,7 +2593,12 @@ static void function_detection_eval(const char *name, struct function_detection
+             function_detection_set(out, 1, available ? "available" : "manual_enabled", detail);
+         }
+     } else {
+-        function_detection_set(out, 1, "available", !strcmp(name, "timezone.html") ? "built-in" : "custom page");
++        char need[200];
++        if (function_meta_from_file(page, "devui-requires", need, sizeof need) &&
++            need[0] == '/' && !strstr(need, "..") && access(need, F_OK) != 0)
++            function_detection_set(out, 0, "requirement_missing", need);
++        else
++            function_detection_set(out, 1, "available", !strcmp(name, "timezone.html") ? "built-in" : "custom page");
+     }
+     plugin_detect_record(name, out, force_log);
+ }
+@@ -2589,6 +2642,7 @@ static int function_page_open(const char *name)
+     snprintf(g_subpage, sizeof g_subpage, "func:%s", name);
+     snprintf(g_subpage_path, sizeof g_subpage_path, "%s", path);
+     g_scroll = 0;
++    xpage_opened(path, millis());
+     return 1;
+ }
+ 
+@@ -2676,7 +2730,8 @@ static const char *speedtest_home_button_html(void)
+ static const char *speedtest_function_tile_html(void)
+ {
+     if (!speedtest_binary_ready()) return "";
+-    return "<a href='act:sub:speedtest.html' class='func-tile ft-speed'>"
++    return "<a href='act:sub:speedtest.html' class='func-tile ft-speed tint-cyan'>"
++           "<span class='func-ic'>速</span>"
+            "<span class='func-name'>网络测速</span>"
+            "<span class='func-desc'>打开完整测速仪表盘</span>"
+            "</a>";
+@@ -2697,22 +2752,75 @@ static const char *function_tile_desc(const char *name)
+     return "自定义工具";
+ }
+ 
++/* Tile glyph + tint: <meta name="devui-icon"/"devui-tint"> override the
++ * built-in table; otherwise the first character of the title is used. */
++static void function_tile_style(const char *name, const char *html, const char *title,
++                                char *icon, size_t icap, char *tint, size_t tcap)
++{
++    static const struct { const char *page, *icon, *tint; } known[] = {
++        { "tailscale.html", "T", "blue" },      { "clash.html", "C", "purple" },
++        { "mihomo.html", "M", "purple" },       { "cpu-performance.html", "芯", "amber" },
++        { "wireguard.html", "W", "green" },     { "operator-lock.html", "营", "orange" },
++        { "fmswitch.html", "猫", "pink" },      { "sim-switch.html", "卡", "orange" },
++        { "sim-traffic.html", "量", "teal" },   { "timezone.html", "时", "slate" },
++    };
++    static const char *tints[] = { "blue", "green", "purple", "orange", "teal", "pink", "amber", "slate" };
++    char m[48];
++    icon[0] = 0; tint[0] = 0;
++    for (size_t i = 0; i < ARRAY_LEN(known); i++)
++        if (!strcmp(name, known[i].page)) {
++            snprintf(icon, icap, "%s", known[i].icon);
++            snprintf(tint, tcap, "%s", known[i].tint);
++        }
++    if (function_meta_from_html(html, "devui-icon", m, sizeof m)) snprintf(icon, icap, "%s", m);
++    if (function_meta_from_html(html, "devui-tint", m, sizeof m)) {
++        int ok = 1;
++        for (const char *q = m; *q; q++) if (!(*q >= 'a' && *q <= 'z')) ok = 0;
++        if (ok) snprintf(tint, tcap, "%s", m);
++    }
++    if (!icon[0] && title && title[0]) {
++        size_t l = 1;
++        unsigned char c = (unsigned char)title[0];
++        if (c >= 0xF0) l = 4; else if (c >= 0xE0) l = 3; else if (c >= 0xC0) l = 2;
++        if (l >= icap) l = icap - 1;
++        memcpy(icon, title, l);
++        icon[l] = 0;
++        if (l == 1 && icon[0] >= 'a' && icon[0] <= 'z') icon[0] = (char)(icon[0] - 32);
++    }
++    if (!tint[0]) {
++        unsigned h = 5381;
++        for (const char *q = name; *q; q++) h = h * 33u + (unsigned char)*q;
++        snprintf(tint, tcap, "%s", tints[h % ARRAY_LEN(tints)]);
++    }
++}
++
+ static int append_function_tile(char *buf, size_t cap, int o, const char *name)
+ {
+-    char path[300], raw[96], title[160], href[160];
++    char path[300], raw[96], title[160], href[160], desc_raw[96], desc[200];
++    char icon_raw[16], icon[48], tint[16];
++    char *html;
+     if (!name || o < 0 || (size_t)o >= cap) return o;
+     if (!subpage_name_ok(name) || !function_control_api_available(name)) return o;
+     snprintf(path, sizeof path, "%s/%s", FUNCTIONS_DIR, name);
+     if (access(path, R_OK) != 0) return o;
+-    function_title_for_file(raw, sizeof raw, path, name);
++    html = read_file(path);
++    if (!html || !function_title_from_html(html, raw, sizeof raw))
++        function_label_from_name(raw, sizeof raw, name);
++    if (!html || !function_meta_from_html(html, "devui-desc", desc_raw, sizeof desc_raw))
++        snprintf(desc_raw, sizeof desc_raw, "%s", function_tile_desc(name));
++    function_tile_style(name, html, raw, icon_raw, sizeof icon_raw, tint, sizeof tint);
++    free(html);
+     html_esc(title, sizeof title, raw);
++    html_esc(desc, sizeof desc, desc_raw);
++    html_esc(icon, sizeof icon, icon_raw);
+     html_esc(href, sizeof href, name);
+     return o + snprintf(buf + o, cap - (size_t)o,
+-                        "<a href=\"act:func:%s\" class=\"func-tile func-custom\">"
++                        "<a href=\"act:func:%s\" class=\"func-tile func-custom tint-%s\">"
++                        "<span class=\"func-ic\">%s</span>"
+                         "<span class=\"func-name\">%s</span>"
+                         "<span class=\"func-desc\">%s</span>"
+                         "</a>",
+-                        href, title, function_tile_desc(name));
++                        href, tint, icon, title, desc);
+ }
+ 
+ static const char *system_function_tiles_html(void)
+@@ -2736,7 +2844,7 @@ static const char *timezone_function_tile_html(void)
+ 
+ static const char *custom_function_tiles_html(void)
+ {
+-    static char buf[8192];
++    static char buf[16384];
+     char names[32][64];
+     int n = 0;
+     DIR *dp;
+@@ -3553,15 +3661,15 @@ static void draw_charts(void)
+     if (html_view_rect("#chart-cpu", &x, &y, &w, &h)) {
+         n = chart_history_values(CHART_CPU, times, a, g_chart_cpu_sec, now_sec);
+         html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+-                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 26);
++                                 0, 100, 0x4c, 0x8d, 0xff, 2, 26);
+         n = chart_history_values(CHART_CPU_TEMP, times, a, g_chart_cpu_sec, now_sec);
+         html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_cpu_sec,
+-                                 20, 70, 0xd5, 0xa6, 0x3d, 2, 0);
++                                 20, 70, 0xf5, 0xa5, 0x24, 2, 0);
+     }
+     if (html_view_rect("#chart-mem", &x, &y, &w, &h)) {
+         n = chart_history_values(CHART_MEM, times, a, g_chart_mem_sec, now_sec);
+         html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_mem_sec,
+-                                 0, 100, 0x55, 0xbc, 0x7b, 2, 34);
++                                 0, 100, 0x34, 0xc7, 0x7b, 2, 34);
+     }
+     if (html_view_rect("#chart-net", &x, &y, &w, &h)) {
+         int mx = 1;
+@@ -3570,9 +3678,9 @@ static void draw_charts(void)
+         for (int i = 0; i < n; i++) if (a[i] > mx) mx = a[i];
+         for (int i = 0; i < nb; i++) if (bvals[i] > mx) mx = bvals[i];
+         html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_net_sec,
+-                                 0, mx, 0x4f, 0x8f, 0xe8, 2, 22);
++                                 0, mx, 0x4c, 0x8d, 0xff, 2, 22);
+         html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_net_sec,
+-                                 0, mx, 0xd5, 0xa6, 0x3d, 2, 0);
++                                 0, mx, 0xf5, 0xa5, 0x24, 2, 0);
+     }
+     if (html_view_rect("#chart-batt", &x, &y, &w, &h)) {
+         int mx = 1;
+@@ -3582,9 +3690,9 @@ static void draw_charts(void)
+         for (int i = 0; i < n; i++) a[i] = (int)((int64_t)a[i] * 100 / mx);
+         for (int i = 0; i < nb; i++) bvals[i] = (bvals[i] - 20) * 2;
+         html_view_timed_polyline(x, y, w, h, times, a, n, now_sec, g_chart_batt_sec,
+-                                 0, 100, 0x4f, 0x8f, 0xe8, 2, 22);
++                                 0, 100, 0x4c, 0x8d, 0xff, 2, 22);
+         html_view_timed_polyline(x, y, w, h, times, bvals, nb, now_sec, g_chart_batt_sec,
+-                                 0, 100, 0xd5, 0xa6, 0x3d, 2, 0);
++                                 0, 100, 0xf5, 0xa5, 0x24, 2, 0);
+     }
+ }
+ 
+@@ -3650,9 +3758,10 @@ static void draw_sms_icon(void)
+ static void draw_native_statusbar(void)
+ {
+     const int dark = !g_theme;
+-    const int bg_r = dark ? 0x11 : 0xdc, bg_g = dark ? 0x1b : 0xe7, bg_b = dark ? 0x27 : 0xf2;
+-    const int fg_r = dark ? 0xee : 0x17, fg_g = dark ? 0xf4 : 0x22, fg_b = dark ? 0xfb : 0x32;
+-    const int dim_r = dark ? 0x6f : 0x7a, dim_g = dark ? 0x80 : 0x89, dim_b = dark ? 0x94 : 0x99;
++    /* matches body.dark / body.light backgrounds in ui/style.css */
++    const int bg_r = dark ? 0x0b : 0xf1, bg_g = dark ? 0x0e : 0xf3, bg_b = dark ? 0x13 : 0xf6;
++    const int fg_r = dark ? 0xee : 0x14, fg_g = dark ? 0xf2 : 0x1a, fg_b = dark ? 0xf7 : 0x22;
++    const int dim_r = dark ? 0x3a : 0xb8, dim_g = dark ? 0x42 : 0xc0, dim_b = dark ? 0x50 : 0xcc;
+ 
+     html_view_fill_rect(0, 0, 320, 26, bg_r, bg_g, bg_b, 255);
+     html_view_draw_text_px(8, 5, g_stat_time, 15, 0, fg_r, fg_g, fg_b, 255);
+@@ -3689,7 +3798,7 @@ static void draw_native_statusbar(void)
+     if (dark)
+         html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, bg_r, bg_g, bg_b, 255);
+     else
+-        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xcb, 0xd7, 0xe4, 255);
++        html_view_fill_round_rect(bat_x + 1, bat_y + 1, bat_w - 2, bat_h - 2, 3, 0xe2, 0xe6, 0xec, 255);
+     html_view_fill_round_rect(tip_x, tip_y, 2, 7, 1, fg_r, fg_g, fg_b, 255);
+ 
+     int bat_pct = clampi(g_stat_bat, 0, 100);
+@@ -6044,6 +6153,7 @@ static int build_kv(struct kv *t, const char *path)
+     if (d.timezone_available)
+         g_display_offset_minutes = d.timezone_effective_minutes;
+     plugin_status_refresh(path, 0);
++    xpage_prepare(path);
+     timezone_sync_draft(&d);
+     traffic_plan_sync_draft(&d);
+     g_charging = d.charger_connect;
+@@ -6625,7 +6735,7 @@ static int build_kv(struct kv *t, const char *path)
+ 
+     /* ---- band lock: universe grows to the largest set seen; selection mirrors
+      * the live lock unless the user is editing in the modal ---- */
+-    static char s_netseg[640], s_simswitch[1200], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[120];
++    static char s_netseg[640], s_simswitch[1200], s_cursa[300], s_curnsa[300], s_curlte[300], s_toast[240];
+     static char s_ts_action_log[2200], s_mh_action_log[2200], s_cpu_action_log[2200];
+     static char s_wg_action_log[2200], s_op_action_log[2200];
+     static char s_sim_action_log[2200], s_fm_action_log[2200];
+@@ -8031,6 +8141,7 @@ int main(void)
+     drm_disp_t disp;
+     if (drm_disp_init(&disp) != 0) { fprintf(stderr, "drm init failed\n"); return 1; }
+     html_view_init(disp.fb, disp.width, disp.height, disp.pitch_px, 1, UI_FONT);
++    xpage_init();
+     html_view_set_uidir(UI_DIR);
+ 
+     touch_input_t touch;
+@@ -9105,6 +9216,26 @@ queued_done:
+                             last_act = now;
+                             need_render = 1;
+                         }
++                        else if (!strncmp(a, "xv:", 3) || !strncmp(a, "xp:", 3)) {
++                            /* adapter page tabs / paging: renderer-local, instant */
++                            int xr = xpage_local(CUR_PATH, a, now);
++                            if (xr == 2) g_scroll = 0;
++                            if (xr) need_render = 1;
++                            last_act = now;
++                        }
++                        else if (!strncmp(a, "x:", 2) || !strncmp(a, "xc:", 3)) {
++                            /* generic adapter action on the open function page */
++                            int confirm = a[1] == 'c';
++                            char tz[32];
++                            devui_posix_tz(tz, sizeof tz);
++                            for (char *q = tz; *q; q++)
++                                if (!strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789<>+-:,./", *q)) { tz[0] = 0; break; }
++                            (void)xpage_action(CUR_PATH, a + (confirm ? 3 : 2), confirm, now, tz,
++                                               g_toast, sizeof g_toast);
++                            g_toast_until = now + (confirm ? 4000 : 1800);
++                            last_act = now;
++                            need_render = 1;
++                        }
+                         else if (!strcmp(a, "cpupowersave") || !strcmp(a, "cpubalance") ||
+                                  !strcmp(a, "cpuperformance") || !strcmp(a, "cpuextreme") ||
+                                  !strcmp(a, "cpurefresh")) {
+@@ -9331,6 +9462,19 @@ action_done:
+         /* dismiss the toast after its timeout */
+         if (g_toast[0] && now >= g_toast_until) { g_toast[0] = 0; need_render = 1; }
+ 
++        /* adapter-backed function pages (functions/<name>.sh): non-blocking */
++        if (!dragging && !scroll_inertia) {
++            char xtoast[sizeof g_toast];
++            xtoast[0] = 0;
++            if (xpage_tick(CUR_PATH, now, backlight_is_on(), xtoast, sizeof xtoast)) {
++                if (xtoast[0]) {
++                    snprintf(g_toast, sizeof g_toast, "%s", xtoast);
++                    g_toast_until = now + 2400;
++                }
++                need_render = 1;
++            }
++        }
++
+         /* power-menu armed state auto-reverts if the second tap doesn't come */
+         if (g_pwr_confirm && now >= g_pwr_until) { g_pwr_confirm = 0; if (menu) need_render = 1; }
+ 
+diff --git a/src/xpage.c b/src/xpage.c
+new file mode 100644
+index 0000000..eb28edb
+--- /dev/null
++++ b/src/xpage.c
+@@ -0,0 +1,715 @@
++/*
++ * xpage.c - adapter-backed custom function pages (see include/xpage.h).
++ *
++ * Adapter contract (ui/functions/<name>.sh, run with `sh`, as root):
++ *   status      print KEY=VALUE lines (KEY: A-Z 0-9 _). Values are HTML-escaped
++ *               by the renderer unless KEY ends in _HTML (adapter escapes those).
++ *               INTERVAL=<1..60> sets the refresh period in seconds.
++ *   <verb>      any act:x:<verb> / act:xc:<verb> target. The first non-empty
++ *               output line becomes the result toast. Must not block for long;
++ *               use `curl -m` style timeouts.
++ * Built-in tokens: {{XS_BUSY}} {{XS_LOG}} {{XS_AGE}} {{XS_READY}} {{XS_API}}
++ *                  {{XS_ARM:<verb>}} ("armed" while a confirm tap is pending).
++ *
++ * API 2 adds renderer-local state, so tabs and paging need no shell round trip:
++ *   act:xv:<view>             switch view; {{XS_VIEW:<view>}} is "on" for the
++ *                             current one (default view "main"). The status run
++ *                             gets the view as $XP_VIEW.
++ *   act:xp:<list>:prev|next|cur|<n>   page a list. The adapter prints
++ *                             PAGES_<LIST>=n and CURPAGE_<LIST>=n and wraps each
++ *                             page in class "xpg xpg-<list>-<n>"; {{XS_STATECSS}}
++ *                             emits the <style> that shows the current pages.
++ *                             {{XS_PAGE:<list>}} {{XS_PAGES:<list>}}
++ *                             {{XS_PREV:<list>}} {{XS_NEXT:<list>}} ("dis" at ends).
++ *
++ * SPDX-License-Identifier: MIT
++ */
++#include "xpage.h"
++
++#include <ctype.h>
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++#define XP_FUNCTIONS_DIR "/data/plugins/u60pro-devui/ui/functions"
++#define XP_NAME_MAX      40
++#define XP_VERB_MAX      64
++#define XP_KV_MAX        128
++#define XP_VAL_MAX       512
++#define XP_HTML_MAX      65536
++#define XP_VIEW_MAX      24
++#define XP_LISTS         6
++#define XP_LOCK_STALE_S  45
++#define XP_ACT_STALE_S   180
++#define XP_CONFIRM_MS    4000
++
++struct xp_kv { const char *k; const char *v; };
++
++static char     g_name[XP_NAME_MAX + 1];
++static char     g_ctl[192];
++static long long g_kv_mtime = -1;
++static time_t   g_kv_wall;
++static uint32_t g_next_status_ms;
++static uint32_t g_last_check_ms;
++static int      g_interval_ms = 3000;
++static int      g_last_busy = -1;
++static char     g_arm_verb[XP_VERB_MAX + 1];
++static uint32_t g_arm_until;
++static uint32_t g_now_ms;
++
++static struct xp_kv g_kv[XP_KV_MAX];
++static int      g_nkv;
++static char     g_arena[262144];
++static size_t   g_arena_used;
++static char     g_filebuf[262144];
++
++struct xp_pager { char name[16]; int page; int touched; };
++static char     g_view[XP_VIEW_MAX + 1];
++static struct xp_pager g_pg[XP_LISTS];
++static int      g_npg;
++static char     g_statecss[1024];
++static char     g_numbuf[16];
++static char     g_logbuf[2048];
++static char     g_agebuf[32];
++
++/* ---------- helpers ---------- */
++
++static long long path_mtime_ns(const char *path, time_t *wall)
++{
++    struct stat st;
++    if (stat(path, &st) != 0) return -1;
++    if (wall) *wall = st.st_mtime;
++    return (long long)st.st_mtime * 1000000000LL + (long long)st.st_mtim.tv_nsec;
++}
++
++static int dir_age_s(const char *path)
++{
++    struct stat st;
++    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
++    time_t now = time(NULL);
++    return now >= st.st_mtime ? (int)(now - st.st_mtime) : 0;
++}
++
++/* Copy at most cap-1 bytes without splitting a UTF-8 sequence. */
++static void utf8_copy(char *dst, size_t cap, const char *src, size_t n)
++{
++    if (!cap) return;
++    if (n > cap - 1) {
++        n = cap - 1;
++        while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) n--;
++    }
++    memcpy(dst, src, n);
++    dst[n] = 0;
++}
++
++/* The panel font has no emoji: drop 4-byte sequences (flags, pictographs),
++ * variation selector U+FE0F, ZWJ U+200D and keycap U+20E3 in place, then trim
++ * the leading blanks a removed flag leaves behind. */
++static void strip_emoji(char *s)
++{
++    unsigned char *r = (unsigned char *)s, *w = (unsigned char *)s;
++    while (*r) {
++        if (*r >= 0xF0) {
++            r++;
++            for (int k = 0; k < 3 && (*r & 0xC0) == 0x80; k++) r++;
++            continue;
++        }
++        /* U+2600-27BF misc symbols/dingbats, U+2B00-2B7F stars/arrows */
++        if (r[0] == 0xE2 && r[1] && r[2] &&
++            ((r[1] >= 0x98 && r[1] <= 0x9E) || r[1] == 0xAC || r[1] == 0xAD)) {
++            r += 3;
++            continue;
++        }
++        if ((r[0] == 0xEF && r[1] == 0xB8 && r[2] == 0x8F) ||
++            (r[0] == 0xE2 && r[1] == 0x80 && r[2] == 0x8D) ||
++            (r[0] == 0xE2 && r[1] == 0x83 && r[2] == 0xA3)) {
++            r += 3;
++            continue;
++        }
++        *w++ = *r++;
++    }
++    *w = 0;
++    w = (unsigned char *)s;
++    while (*w == ' ') w++;
++    if (w != (unsigned char *)s) memmove(s, w, strlen((char *)w) + 1);
++}
++
++static size_t esc_into(char *dst, size_t cap, const char *src, size_t n)
++{
++    size_t o = 0;
++    if (!cap) return 0;
++    for (size_t i = 0; i < n && src[i]; i++) {
++        const char *rep = NULL;
++        switch (src[i]) {
++        case '&': rep = "&amp;"; break;
++        case '<': rep = "&lt;"; break;
++        case '>': rep = "&gt;"; break;
++        case '"': rep = "&quot;"; break;
++        case '\'': rep = "&#39;"; break;
++        default: break;
++        }
++        if (rep) {
++            size_t rl = strlen(rep);
++            if (o + rl >= cap) break;
++            memcpy(dst + o, rep, rl); o += rl;
++        } else {
++            if (o + 1 >= cap) break;
++            dst[o++] = src[i];
++        }
++    }
++    /* never leave a truncated multi-byte sequence at the end */
++    while (o > 0 && ((unsigned char)dst[o - 1] & 0x80)) {
++        size_t s = o - 1;
++        while (s > 0 && ((unsigned char)dst[s] & 0xC0) == 0x80) s--;
++        unsigned char lead = (unsigned char)dst[s];
++        size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
++        if (o - s >= need) break;
++        o = s;
++    }
++    dst[o] = 0;
++    return o;
++}
++
++static int page_name(const char *path, char *name, size_t cap)
++{
++    size_t l = strlen(XP_FUNCTIONS_DIR), bl;
++    const char *b;
++    if (!path || strncmp(path, XP_FUNCTIONS_DIR, l) || path[l] != '/') return 0;
++    b = path + l + 1;
++    bl = strlen(b);
++    if (bl <= 5 || strcmp(b + bl - 5, ".html")) return 0;
++    bl -= 5;
++    if (!bl || bl > XP_NAME_MAX || bl >= cap) return 0;
++    for (size_t i = 0; i < bl; i++) {
++        unsigned char c = (unsigned char)b[i];
++        if (!(isalnum(c) || c == '_' || c == '-')) return 0;
++    }
++    memcpy(name, b, bl);
++    name[bl] = 0;
++    return 1;
++}
++
++static int adapter_for(const char *path, char *name, size_t ncap, char *ctl, size_t ccap)
++{
++    if (!page_name(path, name, ncap)) return 0;
++    snprintf(ctl, ccap, "%s/%s.sh", XP_FUNCTIONS_DIR, name);
++    return access(ctl, R_OK) == 0;
++}
++
++static void run_path(char *dst, size_t cap, const char *suffix)
++{
++    snprintf(dst, cap, "%s/%s%s", XPAGE_RUN_DIR, g_name, suffix);
++}
++
++static int verb_ok(const char *v)
++{
++    size_t n = v ? strlen(v) : 0;
++    if (!n || n > XP_VERB_MAX || v[0] == '-') return 0;
++    for (size_t i = 0; i < n; i++) {
++        unsigned char c = (unsigned char)v[i];
++        if (!(isalnum(c) || c == '_' || c == '.' || c == ':' || c == '=' || c == '-')) return 0;
++    }
++    return 1;
++}
++
++/* ---------- key/value store ---------- */
++
++static void kv_reset(void)
++{
++    g_nkv = 0;
++    g_arena_used = 0;
++    g_interval_ms = 3000;
++}
++
++static int key_ok(const char *k, size_t n)
++{
++    if (!n || n > 48) return 0;
++    for (size_t i = 0; i < n; i++) {
++        unsigned char c = (unsigned char)k[i];
++        if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) return 0;
++    }
++    return 1;
++}
++
++static void kv_parse(char *buf)
++{
++    char *p = buf;
++    kv_reset();
++    while (*p && g_nkv < XP_KV_MAX) {
++        char *e = strchr(p, '\n');
++        char *line = p;
++        if (e) { *e = 0; p = e + 1; } else p += strlen(p);
++        size_t ll = strlen(line);
++        if (ll && line[ll - 1] == '\r') line[--ll] = 0;
++        char *eq = strchr(line, '=');
++        if (!eq) continue;
++        size_t kl = (size_t)(eq - line);
++        if (!key_ok(line, kl)) continue;
++        const char *val = eq + 1;
++        size_t vl = strlen(val);
++        if (kl == 8 && !strncmp(line, "INTERVAL", 8)) {
++            int s = atoi(val);
++            if (s >= 1 && s <= 60) g_interval_ms = s * 1000;
++        }
++        int raw = kl > 5 && !strncmp(line + kl - 5, "_HTML", 5);
++        size_t room = sizeof g_arena - g_arena_used;
++        if (room < kl + 2) break;
++        char *kd = g_arena + g_arena_used;
++        memcpy(kd, line, kl); kd[kl] = 0;
++        g_arena_used += kl + 1;
++        room = sizeof g_arena - g_arena_used;
++        char *vd = g_arena + g_arena_used;
++        size_t vcap = raw ? XP_HTML_MAX : XP_VAL_MAX * 6;
++        if (vcap > room) vcap = room;
++        if (vcap < 1) break;
++        if (raw) {
++            utf8_copy(vd, vcap, val, vl);
++            strip_emoji(vd);
++        } else {
++            char tmp[XP_VAL_MAX];
++            utf8_copy(tmp, sizeof tmp, val, vl);
++            strip_emoji(tmp);
++            esc_into(vd, vcap, tmp, strlen(tmp));
++        }
++        g_arena_used += strlen(vd) + 1;
++        g_kv[g_nkv].k = kd;
++        g_kv[g_nkv].v = vd;
++        g_nkv++;
++    }
++}
++
++static int kv_reload_if_changed(void)
++{
++    char path[256];
++    time_t wall = 0;
++    run_path(path, sizeof path, ".kv");
++    long long mt = path_mtime_ns(path, &wall);
++    if (mt < 0) {
++        if (g_kv_mtime != -1) { g_kv_mtime = -1; kv_reset(); return 1; }
++        return 0;
++    }
++    if (mt == g_kv_mtime) return 0;
++    FILE *fp = fopen(path, "rb");
++    if (!fp) return 0;
++    size_t n = fread(g_filebuf, 1, sizeof g_filebuf - 1, fp);
++    fclose(fp);
++    g_filebuf[n] = 0;
++    g_kv_mtime = mt;
++    g_kv_wall = wall;
++    kv_parse(g_filebuf);
++    return 1;
++}
++
++static void bind_name(const char *name, const char *ctl)
++{
++    if (strcmp(g_name, name)) {
++        snprintf(g_name, sizeof g_name, "%s", name);
++        g_kv_mtime = -1;
++        g_last_busy = -1;
++        g_arm_verb[0] = 0;
++        g_next_status_ms = 0;
++        g_view[0] = 0;
++        g_npg = 0;
++        kv_reset();
++    }
++    snprintf(g_ctl, sizeof g_ctl, "%s", ctl);
++}
++
++/* ---------- local view / pager state (API 2) ---------- */
++
++static const char *kv_raw(const char *key)
++{
++    for (int i = 0; i < g_nkv; i++)
++        if (!strcmp(g_kv[i].k, key)) return g_kv[i].v;
++    return NULL;
++}
++
++static int ident_ok(const char *s, size_t max)
++{
++    size_t n = s ? strlen(s) : 0;
++    if (!n || n > max) return 0;
++    for (size_t i = 0; i < n; i++) {
++        unsigned char c = (unsigned char)s[i];
++        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return 0;
++    }
++    return 1;
++}
++
++static const char *cur_view(void)
++{
++    return g_view[0] ? g_view : "main";
++}
++
++static int list_int(const char *prefix, const char *list, int dflt)
++{
++    char key[48];
++    size_t o = (size_t)snprintf(key, sizeof key, "%s", prefix);
++    for (const char *p = list; *p && o < sizeof key - 1; p++)
++        key[o++] = (char)toupper((unsigned char)*p);
++    key[o] = 0;
++    const char *v = kv_raw(key);
++    int n = v ? atoi(v) : 0;
++    return n > 0 ? n : dflt;
++}
++
++static struct xp_pager *pager_get(const char *list, int create)
++{
++    for (int i = 0; i < g_npg; i++)
++        if (!strcmp(g_pg[i].name, list)) return &g_pg[i];
++    if (!create || g_npg >= XP_LISTS) return NULL;
++    struct xp_pager *p = &g_pg[g_npg++];
++    snprintf(p->name, sizeof p->name, "%s", list);
++    p->page = 0;
++    p->touched = 0;
++    return p;
++}
++
++static int pager_pages(const char *list)
++{
++    return list_int("PAGES_", list, 1);
++}
++
++/* Until the user pages manually, follow the adapter's CURPAGE (e.g. the page
++ * holding the node in use). */
++static int pager_page(const char *list)
++{
++    struct xp_pager *p = pager_get(list, 0);
++    int pages = pager_pages(list);
++    int page = p && p->touched ? p->page : list_int("CURPAGE_", list, 1);
++    if (page < 1) page = 1;
++    if (page > pages) page = pages;
++    return page;
++}
++
++static const char *state_css(void)
++{
++    int o = snprintf(g_statecss, sizeof g_statecss, "<style>");
++    for (int i = 0; i < g_nkv && o < (int)sizeof g_statecss - 64; i++) {
++        const char *k = g_kv[i].k;
++        char list[16];
++        size_t n = 0;
++        if (strncmp(k, "PAGES_", 6)) continue;
++        for (const char *p = k + 6; *p && n < sizeof list - 1; p++)
++            list[n++] = (char)tolower((unsigned char)*p);
++        list[n] = 0;
++        if (!ident_ok(list, sizeof list - 1)) continue;
++        o += snprintf(g_statecss + o, sizeof g_statecss - (size_t)o,
++                      ".xpg-%s-%d{display:block}", list, pager_page(list));
++    }
++    if (o < (int)sizeof g_statecss - 9)
++        snprintf(g_statecss + o, sizeof g_statecss - (size_t)o, "</style>");
++    return g_statecss;
++}
++
++/* ---------- background jobs ---------- */
++
++static void clear_stale_lock(const char *suffix, int stale_s)
++{
++    char p[256];
++    run_path(p, sizeof p, suffix);
++    int age = dir_age_s(p);
++    if (age > stale_s) rmdir(p);
++}
++
++static void spawn_status(void)
++{
++    char cmd[1024];
++    clear_stale_lock(".st", XP_LOCK_STALE_S);
++    /* name/ctl are restricted to [A-Za-z0-9_-] and a fixed directory. */
++    snprintf(cmd, sizeof cmd,
++             "D=%s; N=%s; C=%s; export XP_VIEW=%s; "
++             "( [ -d \"$D/$N.act\" ] && exit 0; mkdir \"$D/$N.st\" 2>/dev/null || exit 0; "
++             "sh \"$C\" status > \"$D/$N.kv.tmp\" 2>/dev/null; "
++             "mv -f \"$D/$N.kv.tmp\" \"$D/$N.kv\"; rmdir \"$D/$N.st\" ) "
++             ">/dev/null 2>&1 </dev/null &",
++             XPAGE_RUN_DIR, g_name, g_ctl, cur_view());
++    (void)system(cmd);
++}
++
++static void spawn_action(const char *verb, const char *tz)
++{
++    char cmd[2048];
++    /* the verb is logged when it starts, so a stuck adapter still leaves a trace */
++    snprintf(cmd, sizeof cmd,
++             "D=%s; N=%s; C=%s; V='%s'; export XP_VIEW=%s; %s%s%s"
++             "( mkdir \"$D/$N.act\" 2>/dev/null || exit 0; "
++             "printf '[%%s] 执行 %%s\\n' \"$(date '+%%m-%%d %%H:%%M:%%S')\" \"$V\" >> \"$D/$N.log\"; "
++             "sh \"$C\" \"$V\" > \"$D/$N.out\" 2>&1; rc=$?; "
++             "T=$(date '+%%m-%%d %%H:%%M:%%S'); "
++             "m=$(sed -n '/[^[:space:]]/{p;q;}' \"$D/$N.out\"); "
++             "[ -n \"$m\" ] || { [ \"$rc\" = 0 ] && m='已完成' || m=\"执行失败（$rc）\"; }; "
++             "printf '%%s\\n' \"$m\" > \"$D/$N.msg\"; "
++             "{ sed \"s/^/[$T] /\" \"$D/$N.out\"; "
++             "[ \"$rc\" = 0 ] || printf '[%%s] 退出码 %%s\\n' \"$T\" \"$rc\"; } >> \"$D/$N.log\"; "
++             "tail -n 40 \"$D/$N.log\" > \"$D/$N.log.t\" && mv -f \"$D/$N.log.t\" \"$D/$N.log\"; "
++             "rm -f \"$D/$N.out\"; "
++             "sh \"$C\" status > \"$D/$N.kv.tmp\" 2>/dev/null && mv -f \"$D/$N.kv.tmp\" \"$D/$N.kv\"; "
++             "rmdir \"$D/$N.act\" ) >/dev/null 2>&1 </dev/null &",
++             XPAGE_RUN_DIR, g_name, g_ctl, verb, cur_view(),
++             tz && *tz ? "export TZ='" : "", tz && *tz ? tz : "", tz && *tz ? "'; " : "");
++    (void)system(cmd);
++}
++
++static int action_busy(void)
++{
++    char p[256];
++    run_path(p, sizeof p, ".act");
++    return dir_age_s(p) >= 0;
++}
++
++/* ---------- public API ---------- */
++
++void xpage_init(void)
++{
++    FILE *fp;
++    mkdir(XPAGE_RUN_DIR, 0700);
++    fp = fopen(XPAGE_RUN_DIR "/api", "w");
++    if (fp) { fprintf(fp, "%s\n", XPAGE_API_MARKER); fclose(fp); }
++    fprintf(stderr, "xpage: %s ready\n", XPAGE_API_MARKER);
++}
++
++int xpage_has_adapter(const char *page_path)
++{
++    char name[XP_NAME_MAX + 1], ctl[192];
++    return adapter_for(page_path, name, sizeof name, ctl, sizeof ctl);
++}
++
++void xpage_prepare(const char *page_path)
++{
++    char name[XP_NAME_MAX + 1], ctl[192];
++    if (!adapter_for(page_path, name, sizeof name, ctl, sizeof ctl)) {
++        g_name[0] = 0;
++        return;
++    }
++    bind_name(name, ctl);
++    (void)kv_reload_if_changed();
++}
++
++void xpage_opened(const char *page_path, uint32_t now_ms)
++{
++    char name[XP_NAME_MAX + 1], ctl[192];
++    if (!adapter_for(page_path, name, sizeof name, ctl, sizeof ctl)) return;
++    bind_name(name, ctl);
++    mkdir(XPAGE_RUN_DIR, 0700);
++    (void)kv_reload_if_changed();
++    g_arm_verb[0] = 0;
++    spawn_status();
++    g_next_status_ms = now_ms + (uint32_t)g_interval_ms;
++}
++
++int xpage_tick(const char *page_path, uint32_t now_ms, int screen_on,
++               char *toast, size_t toast_cap)
++{
++    char name[XP_NAME_MAX + 1], ctl[192], p[256];
++    int changed = 0;
++    g_now_ms = now_ms;
++    if (now_ms - g_last_check_ms < 250) return 0;
++    g_last_check_ms = now_ms;
++    if (!adapter_for(page_path, name, sizeof name, ctl, sizeof ctl)) return 0;
++    bind_name(name, ctl);
++    changed |= kv_reload_if_changed();
++
++    run_path(p, sizeof p, ".msg");
++    FILE *fp = fopen(p, "rb");
++    if (fp) {
++        char raw[256];
++        size_t n = fread(raw, 1, sizeof raw - 1, fp);
++        fclose(fp);
++        unlink(p);
++        raw[n] = 0;
++        raw[strcspn(raw, "\r\n")] = 0;
++        strip_emoji(raw);
++        if (raw[0] && toast && toast_cap) {
++            char cut[160];
++            utf8_copy(cut, toast_cap < sizeof cut ? toast_cap : sizeof cut, raw, strlen(raw));
++            esc_into(toast, toast_cap, cut, strlen(cut));
++        }
++        changed = 1;
++    }
++
++    int busy = action_busy();
++    if (busy) {
++        run_path(p, sizeof p, ".act");
++        if (dir_age_s(p) > XP_ACT_STALE_S) { rmdir(p); busy = 0; }
++    }
++    if (busy != g_last_busy) { g_last_busy = busy; changed = 1; }
++    if (g_arm_verb[0] && (int32_t)(now_ms - g_arm_until) >= 0) { g_arm_verb[0] = 0; changed = 1; }
++
++    if (screen_on && (int32_t)(now_ms - g_next_status_ms) >= 0) {
++        spawn_status();
++        g_next_status_ms = now_ms + (uint32_t)g_interval_ms;
++    }
++    return changed;
++}
++
++int xpage_action(const char *page_path, const char *verb, int confirm,
++                 uint32_t now_ms, const char *posix_tz,
++                 char *toast, size_t toast_cap)
++{
++    char name[XP_NAME_MAX + 1], ctl[192];
++    g_now_ms = now_ms;
++    if (!adapter_for(page_path, name, sizeof name, ctl, sizeof ctl)) {
++        snprintf(toast, toast_cap, "此页面没有控制脚本");
++        return 0;
++    }
++    bind_name(name, ctl);
++    if (!verb_ok(verb)) {
++        snprintf(toast, toast_cap, "无效的操作");
++        return 0;
++    }
++    if (confirm) {
++        if (!(g_arm_verb[0] && !strcmp(g_arm_verb, verb) && (int32_t)(now_ms - g_arm_until) < 0)) {
++            snprintf(g_arm_verb, sizeof g_arm_verb, "%s", verb);
++            g_arm_until = now_ms + XP_CONFIRM_MS;
++            snprintf(toast, toast_cap, "再点一次以确认");
++            return 0;
++        }
++    }
++    g_arm_verb[0] = 0;
++    if (action_busy()) {
++        char p[256];
++        run_path(p, sizeof p, ".act");
++        if (dir_age_s(p) <= XP_ACT_STALE_S) {
++            snprintf(toast, toast_cap, "上一个操作仍在进行");
++            return 0;
++        }
++        rmdir(p);
++    }
++    mkdir(XPAGE_RUN_DIR, 0700);
++    spawn_action(verb, posix_tz);
++    g_last_busy = -1;
++    g_next_status_ms = now_ms + (uint32_t)g_interval_ms;
++    snprintf(toast, toast_cap, "处理中…");
++    return 1;
++}
++
++int xpage_local(const char *page_path, const char *act, uint32_t now_ms)
++{
++    char name[XP_NAME_MAX + 1], ctl[192], buf[64];
++    g_now_ms = now_ms;
++    if (!act || !adapter_for(page_path, name, sizeof name, ctl, sizeof ctl)) return 0;
++    bind_name(name, ctl);
++    if (!strncmp(act, "xv:", 3)) {
++        if (!ident_ok(act + 3, XP_VIEW_MAX) || !strcmp(act + 3, cur_view())) return 0;
++        snprintf(g_view, sizeof g_view, "%s", act + 3);
++        g_arm_verb[0] = 0;
++        spawn_status();                       /* fetch the new view's data now */
++        g_next_status_ms = now_ms + (uint32_t)g_interval_ms;
++        return 2;
++    }
++    if (!strncmp(act, "xp:", 3)) {
++        char *op;
++        snprintf(buf, sizeof buf, "%s", act + 3);
++        op = strchr(buf, ':');
++        if (!op) return 0;
++        *op++ = 0;
++        if (!ident_ok(buf, 15)) return 0;
++        struct xp_pager *p = pager_get(buf, 1);
++        if (!p) return 0;
++        int pages = pager_pages(buf), page = pager_page(buf), next = page;
++        if (!strcmp(op, "prev")) next = page - 1;
++        else if (!strcmp(op, "next")) next = page + 1;
++        else if (!strcmp(op, "cur")) { p->touched = 0; return 1; }
++        else if (*op >= '0' && *op <= '9') next = atoi(op);
++        else return 0;
++        if (next < 1) next = 1;
++        if (next > pages) next = pages;
++        p->touched = 1;
++        if (next == p->page && page == next) return 0;
++        p->page = next;
++        return 1;
++    }
++    return 0;
++}
++
++static const char *log_html(void)
++{
++    char p[256], lines[3][200];
++    int seen = 0, o = 0;
++    run_path(p, sizeof p, ".log");
++    FILE *fp = fopen(p, "r");
++    if (fp) {
++        char line[400];
++        while (fgets(line, sizeof line, fp)) {
++            line[strcspn(line, "\r\n")] = 0;
++            if (!line[0]) continue;
++            utf8_copy(lines[seen % 3], sizeof lines[0], line, strlen(line));
++            seen++;
++        }
++        fclose(fp);
++    }
++    if (!seen) {
++        snprintf(g_logbuf, sizeof g_logbuf, "<div class='svc-log-empty'>暂无操作记录</div>");
++        return g_logbuf;
++    }
++    int count = seen < 3 ? seen : 3, start = seen < 3 ? 0 : seen % 3;
++    g_logbuf[0] = 0;
++    for (int i = 0; i < count && o < (int)sizeof g_logbuf - 1; i++) {
++        char esc[600];
++        esc_into(esc, sizeof esc, lines[(start + i) % 3], strlen(lines[(start + i) % 3]));
++        o += snprintf(g_logbuf + o, sizeof g_logbuf - (size_t)o, "<div class='svc-log-line'>%s</div>", esc);
++    }
++    return g_logbuf;
++}
++
++const char *xpage_lookup(const char *key, size_t n)
++{
++    if (!g_name[0] || !key) return "";
++    if (n > 3 && !strncmp(key, "XS_", 3)) {
++        const char *k = key + 3;
++        size_t kl = n - 3;
++        if (kl == 4 && !strncmp(k, "BUSY", 4)) return action_busy() ? "busy" : "";
++        if (kl == 3 && !strncmp(k, "LOG", 3)) return log_html();
++        if (kl == 3 && !strncmp(k, "API", 3)) return "2";
++        if (kl == 8 && !strncmp(k, "STATECSS", 8)) return state_css();
++        if (kl > 5 && !strncmp(k, "VIEW:", 5)) {
++            const char *cv = cur_view();
++            return strlen(cv) == kl - 5 && !strncmp(cv, k + 5, kl - 5) ? "on" : "";
++        }
++        if ((kl > 5 && (!strncmp(k, "PAGE:", 5) || !strncmp(k, "PREV:", 5) || !strncmp(k, "NEXT:", 5))) ||
++            (kl > 6 && !strncmp(k, "PAGES:", 6))) {
++            char list[16];
++            const char *colon = memchr(k, ':', kl);
++            size_t ln = kl - (size_t)(colon + 1 - k);
++            if (ln >= sizeof list) return "";
++            memcpy(list, colon + 1, ln);
++            list[ln] = 0;
++            if (!ident_ok(list, sizeof list - 1)) return "";
++            int page = pager_page(list), pages = pager_pages(list);
++            if (!strncmp(k, "PAGE:", 5)) { snprintf(g_numbuf, sizeof g_numbuf, "%d", page); return g_numbuf; }
++            if (!strncmp(k, "PAGES:", 6)) { snprintf(g_numbuf, sizeof g_numbuf, "%d", pages); return g_numbuf; }
++            if (!strncmp(k, "PREV:", 5)) return page <= 1 ? "dis" : "";
++            return page >= pages ? "dis" : "";
++        }
++        if (kl == 5 && !strncmp(k, "READY", 5)) return g_kv_mtime >= 0 ? "ready" : "wait";
++        if (kl == 3 && !strncmp(k, "AGE", 3)) {
++            if (g_kv_mtime < 0) return "读取中";
++            time_t now = time(NULL);
++            long d = now >= g_kv_wall ? (long)(now - g_kv_wall) : 0;
++            if (d < 3) snprintf(g_agebuf, sizeof g_agebuf, "刚刚");
++            else if (d < 120) snprintf(g_agebuf, sizeof g_agebuf, "%ld 秒前", d);
++            else snprintf(g_agebuf, sizeof g_agebuf, "%ld 分钟前", d / 60);
++            return g_agebuf;
++        }
++        if (kl > 4 && !strncmp(k, "ARM:", 4)) {
++            const char *v = k + 4;
++            size_t vl = kl - 4;
++            if (g_arm_verb[0] && strlen(g_arm_verb) == vl && !strncmp(g_arm_verb, v, vl) &&
++                (int32_t)(g_now_ms - g_arm_until) < 0)
++                return "armed";
++            return "";
++        }
++        return "";
++    }
++    if (n > 2 && !strncmp(key, "X_", 2)) {
++        const char *k = key + 2;
++        size_t kl = n - 2;
++        for (int i = 0; i < g_nkv; i++)
++            if (strlen(g_kv[i].k) == kl && !strncmp(g_kv[i].k, k, kl)) return g_kv[i].v;
++    }
++    return "";
++}

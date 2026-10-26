@@ -1,0 +1,12 @@
+{
+  "repo": "bakaduang/u60pro-devui-clean",
+  "plugin": "1.2.0",
+  "ui": "clean-1.2.0",
+  "devui": "1.2.12-remix.13-xpage.2",
+  "upstream": {
+    "repo": "https://github.com/scoltzero/u60pro-devui-remix.git",
+    "commit": "6d9c667"
+  },
+  "devuiNotes": "基于 remix v1.2.12-remix.13（NewUI），新增扩展页接口 xpage（v2：本地标签与分页）、功能磁贴图标、Clean 配色状态栏",
+  "uiNotes": "Clean 界面；新增 Clash（mihomo）控制页，配合「Clash 管理」插件使用"
+}

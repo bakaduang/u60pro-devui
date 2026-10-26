@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><link rel="stylesheet" href="style.css"></head>
+<body class="{{THEME}}">
+  {{STATUSBAR}}
+
+  <div class="hero">
+    <div class="hero-row">
+      <div class="hero-col">
+        <div class="hero-lab"><span class="hd dl"></span>下载</div>
+        <div class="hero-val">{{RXSPEED}}</div>
+      </div>
+      <div class="hero-col">
+        <div class="hero-lab"><span class="hd ul"></span>上传</div>
+        <div class="hero-val">{{TXSPEED}}</div>
+      </div>
+    </div>
+    <div class="hero-foot">本次 <b>↓{{RXBYTES}}</b> <b>↑{{TXBYTES}}</b><span class="r">设备 <b>{{CLIENTS}}</b> · 电量 <b>{{BAT}}%</b></span></div>
+  </div>
+
+  {{SIGNALCARDS}}
+  {{NEIGHBORCARDS}}
+  {{TOAST}}
+  <div class="pgpad"></div>
+  {{DOTS}}
+</body>
+</html>

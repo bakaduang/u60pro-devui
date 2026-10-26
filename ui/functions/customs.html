@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <link rel="stylesheet" href="style.css">
+  <title>小海关</title>
+  <meta name="devui-desc" content="代理引擎 · 节点 · 接管">
+  <meta name="devui-icon" content="关">
+  <meta name="devui-tint" content="red">
+  <meta name="devui-requires" content="/data/plugins/customs">
+</head>
+<body>
+  {{XS_STATECSS}}
+  <div class="card xapi-{{XS_API}}"><div class="xempty">当前屏幕程序版本过旧，无法控制小海关。请在 UFI-TOOLS 网页的「屏幕管理」里上传新版扩展渲染程序。</div></div>
+
+  <div class="xneed-{{XS_API}}">
+  <div class="xtabs"><a href="act:xv:main" class="xtab {{XS_VIEW:main}}">概览</a><a href="act:xv:nodes" class="xtab {{XS_VIEW:nodes}}">节点</a><a href="act:xv:proxy" class="xtab {{XS_VIEW:proxy}}">接管</a><a href="act:xv:devices" class="xtab {{XS_VIEW:devices}}">设备</a><a href="act:xv:more" class="xtab {{XS_VIEW:more}}">更多</a></div>
+
+  <div class="xview {{XS_VIEW:main}}">
+    <div class="card {{XS_BUSY}}">
+      <div class="xhead"><span class="xstate r {{X_STATECLASS}}">{{X_STATE}}</span><span class="xbig">{{X_HEADLINE}}</span><span class="xsub">{{X_SUBLINE}}</span></div>
+      <div class="xkv x2"><span class="xc"><span class="xk">下载</span><span class="xv">{{X_SPEED_DOWN}}</span></span><span class="xc xl"><span class="xk">上传</span><span class="xv">{{X_SPEED_UP}}</span></span></div>
+      <div class="xline">当前节点<span class="r">{{X_NOWNODE}} {{X_NOWDELAY}}</span></div>
+      <div class="xline">接管范围<span class="r">{{X_TAKE}}</span></div>
+      <div class="xline">模式 · 连接 · 内存<span class="r">{{X_MODE}} · {{X_CONNS}} · {{X_RSS}}</span></div>
+      <div class="svc-grid">
+        <a href="{{X_PRIMARY_HREF}}" class="svc-btn {{X_PRIMARY_CLASS}} {{XS_ARM:stop}}">{{X_PRIMARY_LABEL}}</a>
+        <a href="act:xc:restart" class="svc-btn {{X_RESTART_CLASS}} {{XS_ARM:restart}}">重启引擎</a>
+        <a href="{{X_PAUSE_HREF}}" class="svc-btn svc-wide {{X_PAUSE_CLASS}} {{XS_ARM:pause}}">{{X_PAUSE_LABEL}}</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="xview {{XS_VIEW:nodes}}">
+    <div class="card {{XS_BUSY}}">
+      <div class="title">节点选择<a href="act:x:test" class="rev r">测速</a></div>
+      <div class="seg seg4"><a href="act:x:strat:auto" class="segc {{X_S_AUTO}}">自动</a><a href="act:x:strat:balance" class="segc {{X_S_BALANCE}}">均衡</a><a href="act:x:strat:fallback" class="segc {{X_S_FALLBACK}}">故障转移</a><a href="act:x:strat:direct" class="segc {{X_S_DIRECT}}">直连</a></div>
+      <div class="xlist">{{X_NODES_HTML}}</div>
+      <div class="xpager"><a href="act:xp:nodes:prev" class="{{XS_PREV:nodes}}">上一页</a><span>{{XS_PAGE:nodes}} / {{XS_PAGES:nodes}}</span><a href="act:xp:nodes:next" class="{{XS_NEXT:nodes}}">下一页</a></div>
+      <div class="xnote">点一下节点即切换（改为手动）；「自动」由小海关按延迟挑选。</div>
+    </div>
+  </div>
+
+  <div class="xview {{XS_VIEW:proxy}}">
+    <div class="card {{XS_BUSY}}">
+      <div class="title">终端代理</div>
+      <div class="seg seg3"><a href="act:xc:s1:off" class="segc {{X_S1_OFF}} {{XS_ARM:s1:off}}">不接管</a><a href="act:xc:s1:white" class="segc {{X_S1_WHITE}} {{XS_ARM:s1:white}}">白名单</a><a href="act:xc:s1:all" class="segc {{X_S1_ALL}} {{XS_ARM:s1:all}}">全部</a></div>
+      <div class="xnote">{{X_S1DESC}}</div>
+    </div>
+    <div class="card">
+      <a href="act:x:s2:{{X_S2NEXT}}" class="row"><span class="lab">本机代理<span class="st">{{X_S2STATE}}</span></span><span class="ctrl"><span class="sw {{X_S2CLASS}}"><span class="sw-track"></span><span class="kn"></span></span></span></a>
+    </div>
+    <div class="card">
+      <div class="title">出站模式<span class="r muted">临时</span></div>
+      <div class="seg seg3"><a href="act:x:mode:rule" class="segc {{X_M_RULE}}">规则</a><a href="act:x:mode:global" class="segc {{X_M_GLOBAL}}">全局</a><a href="act:x:mode:direct" class="segc {{X_M_DIRECT}}">直连</a></div>
+      <div class="xnote">全局 / 直连只在本次运行有效，重启引擎后回到规则。</div>
+    </div>
+  </div>
+
+  <div class="xview {{XS_VIEW:devices}}">
+    <div class="card {{XS_BUSY}}">
+      <div class="title">设备白名单<span class="r muted">{{X_DEVTITLE}}</span></div>
+      <div class="xnote">{{X_DEVNOTE}}</div>
+      <div class="xlist">{{X_DEV_HTML}}</div>
+      <div class="xpager"><a href="act:xp:devices:prev" class="{{XS_PREV:devices}}">上一页</a><span>{{XS_PAGE:devices}} / {{XS_PAGES:devices}}</span><a href="act:xp:devices:next" class="{{XS_NEXT:devices}}">下一页</a></div>
+    </div>
+  </div>
+
+  <div class="xview {{XS_VIEW:more}}">
+    <div class="card {{XS_BUSY}}">
+      <div class="title">订阅<a href="act:x:subup" class="rev r">更新订阅</a></div>
+      {{X_SUB_HTML}}
+    </div>
+    <div class="card">
+      <a href="act:x:boot:{{X_BOOTNEXT}}" class="row"><span class="lab">开机自启<span class="st">{{X_BOOTSTATE}}</span></span><span class="ctrl"><span class="sw {{X_BOOTCLASS}}"><span class="sw-track"></span><span class="kn"></span></span></span></a>
+      <div class="xline">智能直连<span class="r">{{X_LEARN}}</span></div>
+      <div class="xline">小海关版本<span class="r">{{X_PLUGINVER}}</span></div>
+    </div>
+    <div class="card">
+      <div class="title">操作记录<span class="r muted">{{XS_AGE}}</span></div>
+      <div class="svc-log">{{XS_LOG}}</div>
+      <div class="xnote">订阅地址、分流规则、端口等设置请在 UFI-TOOLS 网页的小海关面板修改。</div>
+    </div>
+  </div>
+  </div>
+</body>
+</html>
