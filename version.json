@@ -1,0 +1,23 @@
+{
+  "schema": 2,
+  "tag": "v1.2.0",
+  "repo": "bakaduang/u60pro-devui",
+  "plugin": {
+    "version": "1.2.0",
+    "asset": "u60pro-screen-plugin-v1.2.0.txt",
+    "sha256": "854bf615b59bb77c5948ae92a4341d78f6fa20505ac79fa864882dd4b9da9697"
+  },
+  "devui": {
+    "version": "1.2.12-remix.13-xpage.2",
+    "asset": "u60pro-devui-aarch64",
+    "sha256": "dd5894c9450732678b6e882fadc96e4b718756298fda5fe126d9edbe862438f0",
+    "size": 2487920,
+    "notes": "基于 remix v1.2.12-remix.13（NewUI），新增扩展页接口 xpage（v2：本地标签与分页）、功能磁贴图标、Clean 配色状态栏"
+  },
+  "ui": {
+    "version": "clean-1.2.0",
+    "asset": "ui.tar.gz",
+    "sha256": "c895998232d3f86637621572e73cba217ca99902bab4565f164b940332899c75",
+    "notes": "Clean 界面；新增 Clash（mihomo）控制页，配合「Clash 管理」插件使用"
+  }
+}
